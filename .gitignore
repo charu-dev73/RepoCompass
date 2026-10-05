@@ -1,0 +1,21 @@
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Secrets
+.env
+
+# OS / editor junk
+.DS_Store
+
+# Build output
+dist/
+build/
+*.egg-info/
+
+# Frontend dependencies
+node_modules/
