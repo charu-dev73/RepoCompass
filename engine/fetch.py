@@ -181,6 +181,7 @@ def download_repo_zip(
                     f.write(chunk)
 
     except httpx.RequestError as exc:
+        zip_path.unlink(missing_ok=True)
         raise GitHubAPIError(
             f"Could not download repository: {exc}"
         ) from exc
@@ -193,7 +194,23 @@ def download_repo_zip(
 
 
 class UnsafeArchiveError(Exception):
-    """Raised when a ZIP archive contains an unsafe path."""
+    """Raised when a ZIP archive contains an unsafe path or structure."""
+
+
+class InvalidArchiveError(Exception):
+    """Raised when the ZIP archive is corrupt or invalid."""
+
+
+MAX_EXTRACT_BYTES = 200 * 1024 * 1024
+MAX_EXTRACT_FILES = 10_000
+
+
+def _is_symlink(member: zipfile.ZipInfo) -> bool:
+    """Return True when a ZIP member represents a symbolic link."""
+
+    unix_mode = (member.external_attr >> 16) & 0o170000
+
+    return unix_mode == 0o120000
 
 
 def extract_repo_zip(
@@ -207,31 +224,80 @@ def extract_repo_zip(
 
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    with zipfile.ZipFile(zip_path) as archive:
-        members = archive.infolist()
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            members = archive.infolist()
 
-        for member in members:
-            member_path = Path(member.filename)
-
-            if member_path.is_absolute() or ".." in member_path.parts:
+            if not members:
                 raise UnsafeArchiveError(
-                    f"Unsafe path in archive: {member.filename}"
+                    "Repository ZIP is empty"
                 )
 
-        top_level_dirs = {
-            Path(member.filename).parts[0]
-            for member in members
-            if member.filename
-        }
+            if len(members) > MAX_EXTRACT_FILES:
+                raise UnsafeArchiveError(
+                    f"Repository ZIP contains too many files: "
+                    f"{len(members)} > {MAX_EXTRACT_FILES}"
+                )
 
-        if len(top_level_dirs) != 1:
-            raise UnsafeArchiveError(
-                "Repository ZIP must contain exactly one top-level directory"
+            total_uncompressed_size = sum(
+                member.file_size for member in members
             )
 
-        top_level_dir = next(iter(top_level_dirs))
+            if total_uncompressed_size > MAX_EXTRACT_BYTES:
+                raise UnsafeArchiveError(
+                    f"Repository ZIP expands to "
+                    f"{total_uncompressed_size} bytes, "
+                    f"over the {MAX_EXTRACT_BYTES} byte limit"
+                )
 
-        archive.extractall(dest_dir)
+            top_level_dirs = set()
+            destination_root = dest_dir.resolve()
+
+            for member in members:
+                member_path = Path(member.filename)
+
+                if member_path.is_absolute() or ".." in member_path.parts:
+                    raise UnsafeArchiveError(
+                        f"Unsafe path in archive: {member.filename}"
+                    )
+
+                if _is_symlink(member):
+                    raise UnsafeArchiveError(
+                        f"Symbolic links are not allowed: "
+                        f"{member.filename}"
+                    )
+
+                if not member.filename:
+                    continue
+
+                top_level_dirs.add(member_path.parts[0])
+
+                target_path = (
+                    destination_root / member_path
+                ).resolve()
+
+                try:
+                    target_path.relative_to(destination_root)
+                except ValueError as exc:
+                    raise UnsafeArchiveError(
+                        f"Archive entry escapes destination: "
+                        f"{member.filename}"
+                    ) from exc
+
+            if len(top_level_dirs) != 1:
+                raise UnsafeArchiveError(
+                    "Repository ZIP must contain exactly one "
+                    "top-level directory"
+                )
+
+            top_level_dir = next(iter(top_level_dirs))
+
+            archive.extractall(dest_dir)
+
+    except zipfile.BadZipFile as exc:
+        raise InvalidArchiveError(
+            f"Invalid or corrupt ZIP archive: {zip_path}"
+        ) from exc
 
     extracted_root = dest_dir / top_level_dir
 
