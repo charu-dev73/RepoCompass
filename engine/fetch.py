@@ -1,7 +1,10 @@
 """Fetch a public GitHub repository so it can be analysed."""
 
+import os
 import re
 from urllib.parse import urlparse
+
+import httpx
 
 
 class InvalidGitHubURL(ValueError):
@@ -40,3 +43,57 @@ def parse_github_url(url: str) -> tuple[str, str]:
         raise InvalidGitHubURL(f"Invalid owner or repository name: {url!r}")
 
     return owner, repo
+GITHUB_API = "https://api.github.com"
+
+
+class RepositoryNotFound(Exception):
+    """Raised when the repository does not exist or is not public."""
+
+
+class GitHubAPIError(Exception):
+    """Raised when GitHub cannot be reached or returns an unexpected response."""
+
+
+def get_repo_info(owner: str, repo: str, timeout: float = 10.0) -> dict:
+    """Ask GitHub for basic facts about a repository."""
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "RepoCompass",
+    }
+
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        response = httpx.get(
+            f"{GITHUB_API}/repos/{owner}/{repo}",
+            headers=headers,
+            timeout=timeout,
+        )
+    except httpx.RequestError as exc:
+        raise GitHubAPIError(f"Could not reach GitHub: {exc}") from exc
+
+    if response.status_code == 404:
+        raise RepositoryNotFound(
+            f"{owner}/{repo} not found, or it is not public"
+        )
+
+    if response.status_code in (403, 429):
+        raise GitHubAPIError(
+            "GitHub refused the request (likely rate limit reached)"
+        )
+
+    if response.status_code != 200:
+        raise GitHubAPIError(
+            f"Unexpected GitHub response: {response.status_code}"
+        )
+
+    data = response.json()
+
+    return {
+        "full_name": data["full_name"],
+        "default_branch": data["default_branch"],
+        "size_kb": data["size"],
+        "language": data["language"],
+    }
