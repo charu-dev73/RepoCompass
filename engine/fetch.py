@@ -1,7 +1,7 @@
-"""Fetch a public GitHub repository so it can be analysed."""
-
 import os
 import re
+import zipfile
+from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
@@ -11,7 +11,6 @@ class InvalidGitHubURL(ValueError):
     """Raised when a string is not a usable public GitHub repository URL."""
 
 
-# GitHub owner and repo names only use letters, digits, '-', '_' and '.'
 _NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
@@ -24,25 +23,35 @@ def parse_github_url(url: str) -> tuple[str, str]:
     parsed = urlparse(url.strip())
 
     if parsed.scheme not in ("http", "https"):
-        raise InvalidGitHubURL(f"URL must start with http:// or https://: {url!r}")
+        raise InvalidGitHubURL(
+            f"URL must start with http:// or https://: {url!r}"
+        )
 
     if parsed.netloc.lower() not in ("github.com", "www.github.com"):
-        raise InvalidGitHubURL(f"Not a github.com URL: {url!r}")
+        raise InvalidGitHubURL(
+            f"Not a github.com URL: {url!r}"
+        )
 
     parts = [p for p in parsed.path.split("/") if p]
+
     if len(parts) < 2:
         raise InvalidGitHubURL(
             f"URL must look like https://github.com/<owner>/<repo>: {url!r}"
         )
 
     owner, repo = parts[0], parts[1]
+
     if repo.endswith(".git"):
         repo = repo[:-4]
 
     if not _is_valid_name(owner) or not _is_valid_name(repo):
-        raise InvalidGitHubURL(f"Invalid owner or repository name: {url!r}")
+        raise InvalidGitHubURL(
+            f"Invalid owner or repository name: {url!r}"
+        )
 
     return owner, repo
+
+
 GITHUB_API = "https://api.github.com"
 
 
@@ -54,16 +63,27 @@ class GitHubAPIError(Exception):
     """Raised when GitHub cannot be reached or returns an unexpected response."""
 
 
-def get_repo_info(owner: str, repo: str, timeout: float = 10.0) -> dict:
-    """Ask GitHub for basic facts about a repository."""
+def _github_headers() -> dict:
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "RepoCompass",
     }
 
     token = os.environ.get("GITHUB_TOKEN")
+
     if token:
         headers["Authorization"] = f"Bearer {token}"
+
+    return headers
+
+
+def get_repo_info(
+    owner: str,
+    repo: str,
+    timeout: float = 10.0,
+) -> dict:
+    """Ask GitHub for basic facts about a repository."""
+    headers = _github_headers()
 
     try:
         response = httpx.get(
@@ -72,7 +92,9 @@ def get_repo_info(owner: str, repo: str, timeout: float = 10.0) -> dict:
             timeout=timeout,
         )
     except httpx.RequestError as exc:
-        raise GitHubAPIError(f"Could not reach GitHub: {exc}") from exc
+        raise GitHubAPIError(
+            f"Could not reach GitHub: {exc}"
+        ) from exc
 
     if response.status_code == 404:
         raise RepositoryNotFound(
@@ -97,3 +119,125 @@ def get_repo_info(owner: str, repo: str, timeout: float = 10.0) -> dict:
         "size_kb": data["size"],
         "language": data["language"],
     }
+
+
+MAX_REPO_SIZE_KB = 200_000
+MAX_ZIP_BYTES = 50 * 1024 * 1024
+
+
+class RepositoryTooLarge(Exception):
+    """Raised when a repository exceeds RepoCompass's size limits."""
+
+
+def download_repo_zip(
+    owner: str,
+    repo: str,
+    dest_dir: Path,
+    timeout: float = 30.0,
+) -> Path:
+    """Download the default branch of a repository as a zip into dest_dir."""
+
+    info = get_repo_info(owner, repo)
+
+    if info["size_kb"] > MAX_REPO_SIZE_KB:
+        raise RepositoryTooLarge(
+            f"{owner}/{repo} is {info['size_kb']} KB, "
+            f"over the {MAX_REPO_SIZE_KB} KB limit"
+        )
+
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    zip_path = dest_dir / "repo.zip"
+
+    url = f"{GITHUB_API}/repos/{owner}/{repo}/zipball"
+
+    try:
+        with httpx.stream(
+            "GET",
+            url,
+            headers=_github_headers(),
+            follow_redirects=True,
+            timeout=timeout,
+        ) as response:
+
+            if response.status_code != 200:
+                raise GitHubAPIError(
+                    f"Download failed with status {response.status_code}"
+                )
+
+            total = 0
+
+            with open(zip_path, "wb") as f:
+                for chunk in response.iter_bytes():
+                    total += len(chunk)
+
+                    if total > MAX_ZIP_BYTES:
+                        raise RepositoryTooLarge(
+                            f"Download passed the {MAX_ZIP_BYTES} "
+                            f"byte limit; stopped"
+                        )
+
+                    f.write(chunk)
+
+    except httpx.RequestError as exc:
+        raise GitHubAPIError(
+            f"Could not download repository: {exc}"
+        ) from exc
+
+    except RepositoryTooLarge:
+        zip_path.unlink(missing_ok=True)
+        raise
+
+    return zip_path
+
+
+class UnsafeArchiveError(Exception):
+    """Raised when a ZIP archive contains an unsafe path."""
+
+
+def extract_repo_zip(
+    zip_path: Path,
+    dest_dir: Path,
+) -> Path:
+    """Safely extract a repository ZIP and return its top-level directory."""
+
+    zip_path = Path(zip_path)
+    dest_dir = Path(dest_dir)
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    with zipfile.ZipFile(zip_path) as archive:
+        members = archive.infolist()
+
+        for member in members:
+            member_path = Path(member.filename)
+
+            if member_path.is_absolute() or ".." in member_path.parts:
+                raise UnsafeArchiveError(
+                    f"Unsafe path in archive: {member.filename}"
+                )
+
+        top_level_dirs = {
+            Path(member.filename).parts[0]
+            for member in members
+            if member.filename
+        }
+
+        if len(top_level_dirs) != 1:
+            raise UnsafeArchiveError(
+                "Repository ZIP must contain exactly one top-level directory"
+            )
+
+        top_level_dir = next(iter(top_level_dirs))
+
+        archive.extractall(dest_dir)
+
+    extracted_root = dest_dir / top_level_dir
+
+    if not extracted_root.is_dir():
+        raise UnsafeArchiveError(
+            "Expected repository root directory was not extracted"
+        )
+
+    return extracted_root
