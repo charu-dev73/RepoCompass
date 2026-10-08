@@ -1,5 +1,3 @@
-"""Parse Python source into structured facts, without executing it."""
-
 import ast
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,11 +15,11 @@ class ImportRecord:
 class FileInfo:
     path: Path
     line_count: int = 0
-    docstring: str | None = None  # first line of the module docstring
-    functions: list[str] = field(default_factory=list)  # top-level only
-    classes: list[str] = field(default_factory=list)  # top-level only
+    docstring: str | None = None
+    functions: list[str] = field(default_factory=list)
+    classes: list[str] = field(default_factory=list)
     imports: list[ImportRecord] = field(default_factory=list)
-    has_main_guard: bool = False  # top-level `if __name__ == "__main__":`
+    has_main_guard: bool = False
     parse_error: str | None = None
 
 
@@ -35,21 +33,17 @@ def _extract_imports(tree: ast.AST) -> list[ImportRecord]:
                 records.append(
                     ImportRecord(
                         module=alias.name,
-                        names=[],
-                        level=0,
                         lineno=node.lineno,
                     )
                 )
 
         elif isinstance(node, ast.ImportFrom):
-            names = [alias.name for alias in node.names]
-
             records.append(
                 ImportRecord(
                     module=node.module,
-                    names=names,
-                    level=node.level,
                     lineno=node.lineno,
+                    names=[alias.name for alias in node.names],
+                    level=node.level,
                 )
             )
 
@@ -74,13 +68,15 @@ def _has_main_guard(tree: ast.Module) -> bool:
         operands = [test.left, test.comparators[0]]
 
         has_name = any(
-            isinstance(o, ast.Name) and o.id == "__name__"
-            for o in operands
+            isinstance(operand, ast.Name)
+            and operand.id == "__name__"
+            for operand in operands
         )
 
         has_main = any(
-            isinstance(o, ast.Constant) and o.value == "__main__"
-            for o in operands
+            isinstance(operand, ast.Constant)
+            and operand.value == "__main__"
+            for operand in operands
         )
 
         if has_name and has_main:
@@ -118,3 +114,39 @@ def parse_source(source: bytes | str, path: Path) -> FileInfo:
     info.has_main_guard = _has_main_guard(tree)
 
     return info
+
+
+MAX_FILE_BYTES = 1_000_000
+
+
+def parse_file(root: Path, relative_path: Path) -> FileInfo:
+    """Read one file under root and parse it."""
+    relative_path = Path(relative_path)
+    full_path = Path(root) / relative_path
+
+    try:
+        size = full_path.stat().st_size
+
+        if size > MAX_FILE_BYTES:
+            return FileInfo(
+                path=relative_path,
+                parse_error=(
+                    f"FileTooLarge: {size} bytes "
+                    f"(limit {MAX_FILE_BYTES})"
+                ),
+            )
+
+        source = full_path.read_bytes()
+
+    except OSError as exc:
+        return FileInfo(
+            path=relative_path,
+            parse_error=f"{type(exc).__name__}: {exc}",
+        )
+
+    return parse_source(source, relative_path)
+
+
+def parse_files(root: Path, relative_paths: list[Path]) -> list[FileInfo]:
+    """Parse each file in the order given."""
+    return [parse_file(root, path) for path in relative_paths]
