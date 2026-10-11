@@ -1,3 +1,4 @@
+
 from pathlib import Path
 
 from engine.parse import ImportRecord
@@ -60,10 +61,7 @@ def resolve_absolute_import(
     record: ImportRecord,
     module_map: dict[str, Path],
 ) -> list[Path]:
-    """Resolve an absolute import to repository files, if possible.
-
-    Relative imports are handled separately and return an empty list here.
-    """
+    """Resolve an absolute import to repository files, if possible."""
     if record.level > 0 or record.module is None:
         return []
 
@@ -84,5 +82,55 @@ def resolve_absolute_import(
         elif base_path is not None:
             targets.append(base_path)
 
-    # Remove duplicates while preserving order.
+    return list(dict.fromkeys(targets))
+
+
+def resolve_relative_import(
+    record: ImportRecord,
+    importer_path: Path,
+    module_map: dict[str, Path],
+) -> list[Path]:
+    """Resolve a relative import to repository files.
+
+    importer_path must be relative to the repository root.
+    """
+    if record.level <= 0:
+        return []
+
+    importer = Path(importer_path)
+
+    # The importing file belongs to the package named by its parent directory.
+    package_parts = list(importer.parent.parts)
+
+    # One dot means the current package. Each extra dot moves up one level.
+    levels_up = record.level - 1
+
+    if levels_up > len(package_parts):
+        return []
+
+    if levels_up:
+        package_parts = package_parts[:-levels_up]
+
+    target_parts = package_parts.copy()
+
+    if record.module:
+        target_parts.extend(record.module.split("."))
+
+    base_module = ".".join(target_parts)
+    targets: list[Path] = []
+
+    # Resolve the explicitly named module, e.g. `from .utils import helper`.
+    if record.module and base_module in module_map:
+        targets.append(module_map[base_module])
+
+    # Resolve submodules, e.g. `from . import utils`.
+    for name in record.names:
+        if name == "*":
+            continue
+
+        candidate = ".".join(target_parts + [name])
+
+        if candidate in module_map:
+            targets.append(module_map[candidate])
+
     return list(dict.fromkeys(targets))
