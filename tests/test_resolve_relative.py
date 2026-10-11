@@ -30,24 +30,19 @@ def resolve(record, importer_path, module_map=MODULES):
 
 
 def test_relative_import_from_same_package():
-    assert resolve(
-        rec("utils", ["helper"]),
-        "pkg/main.py",
-    ) == [Path("pkg/utils.py")]
+    assert resolve(rec("utils", ["helper"]), "pkg/main.py") == [
+        Path("pkg/utils.py")
+    ]
 
 
 def test_relative_import_of_submodule():
-    assert resolve(
-        rec(None, ["utils"]),
-        "pkg/main.py",
-    ) == [Path("pkg/utils.py")]
+    assert resolve(rec(None, ["utils"]), "pkg/main.py") == [
+        Path("pkg/utils.py")
+    ]
 
 
 def test_relative_import_of_package_itself():
-    assert resolve(
-        rec(None, ["*"]),
-        "pkg/main.py",
-    ) == []
+    assert resolve(rec(None, ["*"]), "pkg/main.py") == []
 
 
 def test_parent_relative_import():
@@ -59,7 +54,7 @@ def test_parent_relative_import():
 
 def test_parent_relative_import_of_submodule():
     assert resolve(
-        rec(None, ["helpers"], level=1),
+        rec(None, ["helpers"]),
         "pkg/sub/worker.py",
     ) == [Path("pkg/sub/helpers.py")]
 

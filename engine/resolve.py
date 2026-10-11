@@ -80,9 +80,43 @@ def resolve_absolute_import(
         if name != "*" and submodule in module_map:
             targets.append(module_map[submodule])
         elif base_path is not None:
+            # The imported name may be defined or re-exported by this module.
             targets.append(base_path)
 
     return list(dict.fromkeys(targets))
+
+
+def _get_importer_package(
+    importer_path: Path,
+    module_map: dict[str, Path],
+) -> list[str]:
+    """Determine the importer's package using its path in the module map."""
+    importer = Path(importer_path)
+
+    # Prefer the module name associated with the exact importing file.
+    matching_names = [
+        name
+        for name, path in module_map.items()
+        if Path(path) == importer
+    ]
+
+    if matching_names:
+        module_name = max(matching_names, key=len)
+
+        if importer.name == "__init__.py":
+            return module_name.split(".")
+
+        package_name = module_name.rpartition(".")[0]
+        return package_name.split(".") if package_name else []
+
+    # Fallback for an importer that is not present in the module map.
+    parts = list(importer.parent.parts)
+
+    # Source-root paths use module names relative to src/, not src.pkg.
+    if parts and parts[0] == "src":
+        parts = parts[1:]
+
+    return parts
 
 
 def resolve_relative_import(
@@ -90,22 +124,24 @@ def resolve_relative_import(
     importer_path: Path,
     module_map: dict[str, Path],
 ) -> list[Path]:
-    """Resolve a relative import to repository files.
+    """Resolve a relative import to repository files, if possible.
 
     importer_path must be relative to the repository root.
     """
     if record.level <= 0:
         return []
 
-    importer = Path(importer_path)
+    package_parts = _get_importer_package(
+        Path(importer_path),
+        module_map,
+    )
 
-    # The importing file belongs to the package named by its parent directory.
-    package_parts = list(importer.parent.parts)
-
-    # One dot means the current package. Each extra dot moves up one level.
+    # One dot means the current package.
+    # Each additional dot moves up one package level.
     levels_up = record.level - 1
 
-    if levels_up > len(package_parts):
+    # Moving above the top-level package is invalid.
+    if levels_up > 0 and levels_up >= len(package_parts):
         return []
 
     if levels_up:
@@ -119,18 +155,51 @@ def resolve_relative_import(
     base_module = ".".join(target_parts)
     targets: list[Path] = []
 
-    # Resolve the explicitly named module, e.g. `from .utils import helper`.
-    if record.module and base_module in module_map:
-        targets.append(module_map[base_module])
+    # For "from . import name", resolve actual sibling modules first.
+    if record.module is None:
+        if not base_module:
+            return []
 
-    # Resolve submodules, e.g. `from . import utils`.
+        for name in record.names:
+            if name == "*":
+                continue
+
+            candidate = ".".join(target_parts + [name])
+
+            if candidate in module_map:
+                # A real sibling module takes priority over __init__.py.
+                targets.append(module_map[candidate])
+
+            elif (
+                base_module in module_map
+                and Path(module_map[base_module]).name == "__init__.py"
+                and name not in module_map
+            ):
+                # The name may be defined or re-exported in __init__.py.
+                # Do not mistake an unrelated root-level module for a
+                # member of the current package.
+                targets.append(module_map[base_module])
+
+        return list(dict.fromkeys(targets))
+
+    # For "from .module import name", resolve the explicit module and
+    # then any imported submodules.
+    base_path = module_map.get(base_module)
+
+    if not record.names:
+        return [base_path] if base_path is not None else []
+
     for name in record.names:
         if name == "*":
             continue
 
-        candidate = ".".join(target_parts + [name])
+        candidate = f"{base_module}.{name}"
 
         if candidate in module_map:
             targets.append(module_map[candidate])
+
+        elif base_path is not None:
+            # The imported name may be defined in the explicit module.
+            targets.append(base_path)
 
     return list(dict.fromkeys(targets))
