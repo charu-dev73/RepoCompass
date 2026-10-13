@@ -66,3 +66,55 @@ def test_load_repository_builds_dependency_graph(
     assert snapshot.graph.in_degree(Path("services.py")) == 1
     assert snapshot.graph.out_degree(Path("app.py")) == 1
 
+
+def test_repo_snapshot_has_empty_entrypoints_by_default():
+    snapshot = RepoSnapshot(
+        owner="example",
+        repo="example",
+        root=Path("."),
+        discovery=None,
+        files=[],
+    )
+
+    assert snapshot.entrypoints == []
+
+def test_load_repository_detects_entrypoints(
+    tmp_path,
+    monkeypatch,
+):
+    import engine.pipeline as pipeline
+
+    repo_root = tmp_path / "fake_repo"
+    repo_root.mkdir()
+
+    (repo_root / "main.py").write_text(
+        'if __name__ == "__main__":\n    print("hello")\n',
+        encoding="utf-8",
+    )
+
+    (repo_root / "helper.py").write_text(
+        "def hello():\n    return 'hello'\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        pipeline,
+        "download_repo_zip",
+        lambda owner, repo, workdir: tmp_path / "fake.zip",
+    )
+
+    monkeypatch.setattr(
+        pipeline,
+        "extract_repo_zip",
+        lambda zip_path, destination: repo_root,
+    )
+
+    snapshot = load_repository(
+        "https://github.com/example/example",
+        tmp_path,
+    )
+
+    assert Path("main.py") in snapshot.entrypoints
+
+
+
