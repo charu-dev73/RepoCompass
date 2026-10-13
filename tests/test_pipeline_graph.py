@@ -1,0 +1,68 @@
+
+from pathlib import Path
+
+from engine.pipeline import RepoSnapshot, load_repository
+
+
+def test_repo_snapshot_has_an_empty_graph_by_default():
+    snapshot = RepoSnapshot(
+        owner="example",
+        repo="example",
+        root=Path("."),
+        discovery=None,
+        files=[],
+    )
+
+    assert snapshot.graph.nodes() == []
+    assert snapshot.graph.edges() == []
+
+def test_load_repository_builds_dependency_graph(
+    tmp_path,
+    monkeypatch,
+):
+    import engine.pipeline as pipeline
+
+    # Create a small fake repository.
+    repo_root = tmp_path / "fake_repo"
+    repo_root.mkdir()
+
+    (repo_root / "app.py").write_text(
+        "import services\n",
+        encoding="utf-8",
+    )
+
+    (repo_root / "services.py").write_text(
+        "def hello():\n    return 'hello'\n",
+        encoding="utf-8",
+    )
+
+    # Avoid downloading anything from GitHub.
+    monkeypatch.setattr(
+        pipeline,
+        "download_repo_zip",
+        lambda owner, repo, workdir: tmp_path / "fake.zip",
+    )
+
+    monkeypatch.setattr(
+        pipeline,
+        "extract_repo_zip",
+        lambda zip_path, destination: repo_root,
+    )
+
+    snapshot = load_repository(
+        "https://github.com/example/example",
+        tmp_path,
+    )
+
+    assert snapshot.graph.nodes() == [
+        Path("app.py"),
+        Path("services.py"),
+    ]
+
+    assert snapshot.graph.edges() == [
+        (Path("app.py"), Path("services.py")),
+    ]
+
+    assert snapshot.graph.in_degree(Path("services.py")) == 1
+    assert snapshot.graph.out_degree(Path("app.py")) == 1
+
