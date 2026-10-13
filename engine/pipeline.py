@@ -9,6 +9,7 @@ from engine.entrypoints import detect_entrypoints
 from engine.fetch import download_repo_zip, extract_repo_zip, parse_github_url
 from engine.graph import DependencyGraph, build_dependency_graph
 from engine.parse import FileInfo, parse_files
+from engine.reading_path import ReadingStep, generate_reading_path
 from engine.resolve import build_module_map
 
 
@@ -21,6 +22,7 @@ class RepoSnapshot:
     files: list[FileInfo]
     graph: DependencyGraph = field(default_factory=DependencyGraph)
     entrypoints: list[Path] = field(default_factory=list)
+    reading_path: list[ReadingStep] = field(default_factory=list)
 
 
 def load_repository(url: str, workdir: Path) -> RepoSnapshot:
@@ -40,6 +42,7 @@ def load_repository(url: str, workdir: Path) -> RepoSnapshot:
     module_map = build_module_map(discovery.python_files)
     graph = build_dependency_graph(files, module_map)
     entrypoints = detect_entrypoints(files, graph)
+    reading_path = generate_reading_path(graph, entrypoints)
 
     return RepoSnapshot(
         owner=owner,
@@ -49,4 +52,5 @@ def load_repository(url: str, workdir: Path) -> RepoSnapshot:
         files=files,
         graph=graph,
         entrypoints=entrypoints,
+        reading_path=reading_path,
     )
