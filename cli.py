@@ -36,7 +36,11 @@ def main() -> int:
 
     try:
         with tempfile.TemporaryDirectory(prefix="repocompass-") as tmp:
-            snapshot = load_repository(repo_url, Path(tmp))
+            snapshot = load_repository(
+                repo_url,
+                Path(tmp),
+                fetch_issues=True,
+            )
 
             discovered_files = snapshot.discovery.python_files
             skipped = snapshot.discovery.skipped_dirs
@@ -72,6 +76,15 @@ def main() -> int:
                     print(f"     Why: {step.reason}")
             else:
                 print("\nNo reading path could be generated.")
+
+            print("\nBeginner-friendly contribution issues:")
+            if snapshot.contribution_issues:
+                for issue in snapshot.contribution_issues:
+                    print(f"\n  #{issue['number']}: {issue['title']}")
+                    print(f"  URL: {issue['url']}")
+                    print(f"  Labels: {', '.join(issue['labels'])}")
+            else:
+                print("  No matching open issues found.")
 
             if discovered_files:
                 print("\nPython files:")
