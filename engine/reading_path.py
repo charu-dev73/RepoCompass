@@ -28,8 +28,8 @@ def generate_reading_path(
     visited: set[Path] = set()
     candidates: list[tuple[Path, int, str]] = []
 
-    # Prefer detected entry points that actually exist in the graph.
-    for path in sorted(set(map(Path, entrypoints)), key=str):
+    # Preserve the caller's entry-point priority order while de-duplicating.
+    for path in map(Path, entrypoints):
         if path in nodes and path not in visited:
             visited.add(path)
             queue.append((path, 0))

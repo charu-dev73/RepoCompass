@@ -1,7 +1,9 @@
 
 from pathlib import Path
 
-from engine.graph import DependencyGraph
+from engine.entrypoints import detect_entrypoints
+from engine.graph import DependencyGraph, build_dependency_graph
+from engine.parse import parse_source
 from engine.reading_path import generate_reading_path
 
 
@@ -35,6 +37,63 @@ def test_path_follows_dependencies():
         Path("db.py"),
     ]
     assert [step.order for step in result] == [1, 2, 3]
+
+
+def test_preserves_supplied_entrypoint_priority_order():
+    graph = make_graph(
+        [],
+        ["app.py", "cli.py", "main.py"],
+    )
+
+    result = generate_reading_path(
+        graph,
+        [Path("main.py"), Path("cli.py"), Path("app.py")],
+    )
+
+    assert [step.path for step in result] == [
+        Path("main.py"),
+        Path("cli.py"),
+        Path("app.py"),
+    ]
+
+
+def test_duplicate_entrypoints_keep_first_priority_position():
+    graph = make_graph(
+        [],
+        ["app.py", "main.py"],
+    )
+
+    result = generate_reading_path(
+        graph,
+        [Path("main.py"), Path("app.py"), Path("main.py")],
+    )
+
+    assert [step.path for step in result] == [
+        Path("main.py"),
+        Path("app.py"),
+    ]
+
+
+def test_uses_entrypoint_detection_priority_order():
+    files = [
+        parse_source("", Path("app.py")),
+        parse_source("", Path("cli.py")),
+        parse_source("", Path("main.py")),
+        parse_source("", Path("helper.py")),
+    ]
+
+    graph = build_dependency_graph(files)
+    entrypoints = detect_entrypoints(files, graph)
+
+    assert entrypoints == [
+        Path("main.py"),
+        Path("cli.py"),
+        Path("app.py"),
+    ]
+
+    result = generate_reading_path(graph, entrypoints)
+
+    assert [step.path for step in result][:3] == entrypoints
 
 
 def test_handles_cycles():
