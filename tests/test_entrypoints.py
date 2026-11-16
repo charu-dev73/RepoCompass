@@ -1,7 +1,12 @@
 
 from pathlib import Path
 
-from engine.entrypoints import detect_entrypoints
+import pytest
+
+from engine.entrypoints import (
+    detect_entrypoint_groups,
+    detect_entrypoints,
+)
 from engine.graph import build_dependency_graph
 from engine.parse import parse_source
 
@@ -152,3 +157,60 @@ def test_no_entrypoints_returns_empty_list():
     files = [parse_file("helper.py")]
 
     assert detect_entrypoints(files) == []
+
+
+def test_conventional_app_in_test_fixture_is_secondary():
+    fixture = Path("tests/test_apps/cliapp/app.py")
+    app = Path("src/flask/app.py")
+    files = [parse_file(str(fixture)), parse_file(str(app))]
+
+    groups = detect_entrypoint_groups(files)
+
+    assert groups.primary == [app]
+    assert groups.secondary == [fixture]
+    assert detect_entrypoints(files) == [app]
+
+
+def test_runnable_script_in_examples_directory_is_secondary():
+    path = Path("examples/run_demo.py")
+    files = [parse_file(str(path), MAIN_GUARD)]
+
+    groups = detect_entrypoint_groups(files)
+
+    assert groups.primary == []
+    assert groups.secondary == [path]
+
+
+def test_genuine_application_entrypoint_is_primary():
+    path = Path("app.py")
+    files = [
+        parse_file(str(path), MAIN_GUARD),
+        parse_file("helpers.py"),
+    ]
+
+    groups = detect_entrypoint_groups(files)
+
+    assert groups.primary == [path]
+    assert groups.secondary == []
+
+
+@pytest.mark.parametrize(
+    "package_dir",
+    [
+        "testing_tools",
+        "example_helpers",
+    ],
+)
+def test_package_module_with_supporting_substring_remains_primary(
+    package_dir,
+):
+    path = Path(f"src/pkg/{package_dir}/main.py")
+    files = [
+        parse_file(f"src/pkg/{package_dir}/__init__.py"),
+        parse_file(str(path)),
+    ]
+
+    groups = detect_entrypoint_groups(files)
+
+    assert groups.primary == [path]
+    assert groups.secondary == []

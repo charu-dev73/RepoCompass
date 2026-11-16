@@ -129,11 +129,16 @@ def test_extract_repo_zip_rejects_zip_bomb_size(tmp_path, monkeypatch):
         extract_repo_zip(zip_path, extract_dir)
 
 
-def test_extract_repo_zip_rejects_symlink(tmp_path):
+def test_extract_repo_zip_skips_archive_symlink(tmp_path):
     zip_path = tmp_path / "unsafe.zip"
     extract_dir = tmp_path / "extracted"
 
     with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr(
+            "repo/README.md",
+            "safe content",
+        )
+
         info = zipfile.ZipInfo(
             "repo/passwd",
         )
@@ -147,8 +152,11 @@ def test_extract_repo_zip_rejects_symlink(tmp_path):
             "../../etc/passwd",
         )
 
-    with pytest.raises(UnsafeArchiveError):
-        extract_repo_zip(zip_path, extract_dir)
+    result = extract_repo_zip(zip_path, extract_dir)
+
+    assert result == extract_dir / "repo"
+    assert (result / "README.md").read_text() == "safe content"
+    assert not (result / "passwd").exists()
 
 
 def test_extract_repo_zip_rejects_corrupt_zip(tmp_path):

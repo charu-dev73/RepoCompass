@@ -1,7 +1,6 @@
 from pathlib import Path
 
-from engine.discover import find_python_files
-
+from engine.discover import find_doc_files, find_python_files
 
 def make_files(root, names):
     """Create empty files, making parent folders as needed."""
@@ -151,3 +150,60 @@ def test_skipped_dirs_are_sorted_deterministically(tmp_path):
         Path("node_modules"),
         Path("venv"),
     ]
+
+
+def test_finds_documentation_files(tmp_path):
+    make_files(
+        tmp_path,
+        [
+            "README.md",
+            "docs/guide.rst",
+            "docs/internals/contributing.txt",
+            "src/app.py",
+            "data/notes.txt",
+        ],
+    )
+
+    result = find_doc_files(tmp_path)
+
+    assert result.doc_files == [
+        Path("README.md"),
+        Path("docs/guide.rst"),
+        Path("docs/internals/contributing.txt"),
+    ]
+
+
+def test_skips_unwanted_documentation_directories(tmp_path):
+    make_files(
+        tmp_path,
+        [
+            "docs/guide.rst",
+            ".git/old.md",
+            "node_modules/package/README.md",
+            "docs/_build/generated.rst",
+        ],
+    )
+
+    result = find_doc_files(tmp_path)
+
+    assert result.doc_files == [Path("docs/guide.rst")]
+
+
+def test_documentation_paths_are_relative_and_sorted(tmp_path):
+    make_files(
+        tmp_path,
+        [
+            "z/guide.md",
+            "README.md",
+            "docs/guide.rst",
+        ],
+    )
+
+    result = find_doc_files(tmp_path)
+
+    assert result.doc_files == [
+        Path("README.md"),
+        Path("docs/guide.rst"),
+        Path("z/guide.md"),
+    ]
+    assert all(isinstance(path, Path) for path in result.doc_files)

@@ -1,6 +1,7 @@
 
 """Detect likely Python application entry points."""
 
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from engine.graph import DependencyGraph
@@ -16,10 +17,37 @@ ENTRYPOINT_NAMES = {
     "manage.py": 80,
 }
 
+SUPPORTING_DIRECTORY_NAMES = {
+    "test",
+    "tests",
+    "testing",
+    "fixtures",
+    "example",
+    "examples",
+    "sample",
+    "samples",
+    "demo",
+    "demos",
+    "docs",
+    "doc",
+    "documentation",
+    "benchmark",
+    "benchmarks",
+    "bench",
+    "tutorial",
+    "tutorials",
+}
+
 # A main guard alone is weaker evidence than a conventional entry-point name.
 # It usually marks a script that can be run directly, but library modules also
 # use it to support direct execution.
 STANDALONE_MAIN_GUARD_SCORE = 60
+
+
+@dataclass
+class EntrypointGroups:
+    primary: list[Path] = field(default_factory=list)
+    secondary: list[Path] = field(default_factory=list)
 
 
 def _is_test_path(path: Path) -> bool:
@@ -32,6 +60,21 @@ def _is_test_path(path: Path) -> bool:
         or name.startswith("test_")
         or name.endswith("_test.py")
     )
+
+
+def _is_supporting_path(path: Path) -> bool:
+    """Return True for runnable files in test or example-style directories."""
+    if _is_test_path(path):
+        return True
+
+    return any(
+        part.lower() in SUPPORTING_DIRECTORY_NAMES
+        for part in path.parts[:-1]
+    )
+
+
+def _sorted_paths(scores: dict[Path, int]) -> list[Path]:
+    return sorted(scores, key=lambda path: (-scores[path], str(path)))
 
 
 def _imported_by_source(
@@ -84,12 +127,13 @@ def _score_entrypoint(
     return STANDALONE_MAIN_GUARD_SCORE
 
 
-def detect_entrypoints(
+def detect_entrypoint_groups(
     files: list[FileInfo],
     graph: DependencyGraph | None = None,
-) -> list[Path]:
-    """Return likely entry-point files in priority order."""
-    scores: dict[Path, int] = {}
+) -> EntrypointGroups:
+    """Return primary and secondary entry-point files in priority order."""
+    primary_scores: dict[Path, int] = {}
+    secondary_scores: dict[Path, int] = {}
     package_dirs = _package_directories(files)
 
     for info in files:
@@ -106,8 +150,23 @@ def detect_entrypoints(
             package_dirs,
         )
 
-        if score > 0:
-            scores[path] = score
+        if score <= 0:
+            continue
 
-    # Higher scores first, then alphabetical order for deterministic results.
-    return sorted(scores, key=lambda path: (-scores[path], str(path)))
+        if _is_supporting_path(path):
+            secondary_scores[path] = score
+        else:
+            primary_scores[path] = score
+
+    return EntrypointGroups(
+        primary=_sorted_paths(primary_scores),
+        secondary=_sorted_paths(secondary_scores),
+    )
+
+
+def detect_entrypoints(
+    files: list[FileInfo],
+    graph: DependencyGraph | None = None,
+) -> list[Path]:
+    """Return primary entry-point files in priority order."""
+    return detect_entrypoint_groups(files, graph).primary
