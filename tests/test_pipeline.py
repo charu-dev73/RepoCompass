@@ -9,6 +9,10 @@ from engine.fetch import (
     InvalidGitHubURL,
     RepositoryNotFound,
 )
+from engine.issues import (
+    IssueDiscoveryResult,
+    IssueDiscoveryStatus,
+)
 
 
 def make_repo_zip(path):
@@ -81,8 +85,8 @@ def test_load_repository_maps_issue_to_files_and_docs(
     monkeypatch.setattr(pipeline, "download_repo_zip", fake_download)
     monkeypatch.setattr(
         pipeline,
-        "find_first_contribution_issues",
-        lambda owner, repo: [issue],
+        "discover_contribution_issues",
+        lambda owner, repo: IssueDiscoveryResult(issues=[issue]),
     )
 
     snapshot = pipeline.load_repository(
@@ -92,6 +96,8 @@ def test_load_repository_maps_issue_to_files_and_docs(
     )
 
     assert snapshot.contribution_issues == [issue]
+    assert snapshot.issue_discovery["status"] == "complete"
+    assert snapshot.issue_discovery["complete"] is True
 
     file_matches = snapshot.issue_file_matches[42]
     assert file_matches[0]["path"] == "src/auth.py"
@@ -133,8 +139,8 @@ def test_missing_optional_issue_fields_do_not_abort_analysis(
     monkeypatch.setattr(pipeline, "download_repo_zip", fake_download)
     monkeypatch.setattr(
         pipeline,
-        "find_first_contribution_issues",
-        lambda owner, repo: [issue],
+        "discover_contribution_issues",
+        lambda owner, repo: IssueDiscoveryResult(issues=[issue]),
     )
 
     snapshot = pipeline.load_repository(
@@ -144,6 +150,7 @@ def test_missing_optional_issue_fields_do_not_abort_analysis(
     )
 
     assert snapshot.contribution_issues == [issue]
+    assert snapshot.issue_discovery["status"] == "complete"
     assert snapshot.discovery.python_files == [
         Path("src/auth.py"),
         Path("src/database.py"),
@@ -167,17 +174,22 @@ def test_malformed_optional_issue_data_warns_without_aborting(
         make_issue_repo_zip(zip_path)
         return zip_path
 
-    def fake_issues(owner, repo):
-        raise GitHubAPIError(
+    def fake_discovery(owner, repo):
+        error = GitHubAPIError(
             "Malformed GitHub issue response at index 0: "
             "'labels' must be a list"
+        )
+        return IssueDiscoveryResult(
+            status=IssueDiscoveryStatus.FAILED,
+            warnings=[f"could not fetch contribution issues: {error}"],
+            error=error,
         )
 
     monkeypatch.setattr(pipeline, "download_repo_zip", fake_download)
     monkeypatch.setattr(
         pipeline,
-        "find_first_contribution_issues",
-        fake_issues,
+        "discover_contribution_issues",
+        fake_discovery,
     )
 
     snapshot = pipeline.load_repository(
@@ -189,6 +201,8 @@ def test_malformed_optional_issue_data_warns_without_aborting(
     assert snapshot.contribution_issues == []
     assert snapshot.issue_file_matches == {}
     assert snapshot.issue_doc_matches == {}
+    assert snapshot.issue_discovery["status"] == "failed"
+    assert snapshot.issue_discovery["complete"] is False
     assert snapshot.discovery.python_files == [
         Path("src/auth.py"),
         Path("src/database.py"),
@@ -247,16 +261,21 @@ def test_issue_not_found_warns_without_aborting(
         make_repo_zip(zip_path)
         return zip_path
 
-    def fake_issues(owner, repo):
-        raise RepositoryNotFound(
+    def fake_discovery(owner, repo):
+        error = RepositoryNotFound(
             f"{owner}/{repo} not found, or it is not public"
+        )
+        return IssueDiscoveryResult(
+            status=IssueDiscoveryStatus.FAILED,
+            warnings=[f"could not fetch contribution issues: {error}"],
+            error=error,
         )
 
     monkeypatch.setattr(pipeline, "download_repo_zip", fake_download)
     monkeypatch.setattr(
         pipeline,
-        "find_first_contribution_issues",
-        fake_issues,
+        "discover_contribution_issues",
+        fake_discovery,
     )
 
     snapshot = pipeline.load_repository(
@@ -266,6 +285,7 @@ def test_issue_not_found_warns_without_aborting(
     )
 
     assert snapshot.contribution_issues == []
+    assert snapshot.issue_discovery["status"] == "failed"
     assert snapshot.discovery.python_files == [
         Path("app.py"),
         Path("pkg/util.py"),
@@ -275,6 +295,56 @@ def test_issue_not_found_warns_without_aborting(
 
     assert "Warning: could not fetch contribution issues" in captured.out
     assert "not found" in captured.out
+
+
+def test_budget_exhausted_issue_scan_keeps_partial_results(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    def fake_download(owner, repo, dest_dir):
+        zip_path = dest_dir / "repo.zip"
+        make_issue_repo_zip(zip_path)
+        return zip_path
+
+    issue = contribution_issue()
+    warning = (
+        "contribution issue scan stopped after 300 items because "
+        "the scan budget (300) was exhausted"
+    )
+
+    monkeypatch.setattr(pipeline, "download_repo_zip", fake_download)
+    monkeypatch.setattr(
+        pipeline,
+        "discover_contribution_issues",
+        lambda owner, repo: IssueDiscoveryResult(
+            issues=[issue],
+            status=IssueDiscoveryStatus.BUDGET_EXHAUSTED,
+            scanned_items=300,
+            pages_fetched=3,
+            warnings=[warning],
+        ),
+    )
+
+    snapshot = pipeline.load_repository(
+        "https://github.com/example/repo",
+        tmp_path,
+        fetch_issues=True,
+    )
+
+    assert snapshot.contribution_issues == [issue]
+    assert snapshot.issue_discovery == {
+        "status": "budget_exhausted",
+        "complete": False,
+        "issues_found": 1,
+        "scanned_items": 300,
+        "pages_fetched": 3,
+        "warnings": [warning],
+        "error": None,
+    }
+    assert 42 in snapshot.issue_file_matches
+    assert 42 in snapshot.issue_doc_matches
+    assert f"Warning: {warning}" in capsys.readouterr().out
 
 
 def test_load_repository_resolves_symlinked_workdir(

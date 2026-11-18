@@ -14,15 +14,13 @@ from engine.discover import (
 from engine.doc_issue_mapping import map_issue_to_docs
 from engine.entrypoints import detect_entrypoint_groups
 from engine.fetch import (
-    GitHubAPIError,
-    RepositoryNotFound,
     download_repo_zip,
     extract_repo_zip,
     parse_github_url,
 )
 from engine.graph import DependencyGraph, build_dependency_graph
 from engine.issue_mapping import map_issue_to_files
-from engine.issues import find_first_contribution_issues
+from engine.issues import discover_contribution_issues
 from engine.parse import FileInfo, parse_files
 from engine.reading_path import ReadingStep, generate_reading_path
 from engine.resolve import build_module_map
@@ -49,6 +47,7 @@ class RepoSnapshot:
     issue_doc_matches: dict[int, list[dict[str, Any]]] = field(
         default_factory=dict
     )
+    issue_discovery: dict[str, Any] | None = None
 
 
 def load_repository(
@@ -87,33 +86,32 @@ def load_repository(
     contribution_issues: list[dict[str, Any]] = []
     issue_file_matches: dict[int, list[dict[str, Any]]] = {}
     issue_doc_matches: dict[int, list[dict[str, Any]]] = {}
+    issue_discovery: dict[str, Any] | None = None
 
     if fetch_issues:
-        try:
-            contribution_issues = find_first_contribution_issues(
-                owner,
-                repo,
+        issue_result = discover_contribution_issues(owner, repo)
+        contribution_issues = issue_result.issues
+        issue_discovery = issue_result.as_dict()
+
+        for warning in issue_result.warnings:
+            print(f"Warning: {warning}")
+
+        for issue in contribution_issues:
+            issue_number = issue.get("number")
+
+            if issue_number is None:
+                continue
+
+            issue_file_matches[issue_number] = map_issue_to_files(
+                issue,
+                files,
             )
 
-            for issue in contribution_issues:
-                issue_number = issue.get("number")
-
-                if issue_number is None:
-                    continue
-
-                issue_file_matches[issue_number] = map_issue_to_files(
-                    issue,
-                    files,
-                )
-
-                issue_doc_matches[issue_number] = map_issue_to_docs(
-                    issue,
-                    doc_discovery.doc_files,
-                    root,
-                )
-
-        except (GitHubAPIError, RepositoryNotFound) as exc:
-            print(f"Warning: could not fetch contribution issues: {exc}")
+            issue_doc_matches[issue_number] = map_issue_to_docs(
+                issue,
+                doc_discovery.doc_files,
+                root,
+            )
 
     return RepoSnapshot(
         owner=owner,
@@ -129,4 +127,5 @@ def load_repository(
         contribution_issues=contribution_issues,
         issue_file_matches=issue_file_matches,
         issue_doc_matches=issue_doc_matches,
+        issue_discovery=issue_discovery,
     )

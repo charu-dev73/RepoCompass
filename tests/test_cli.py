@@ -1,7 +1,10 @@
+from pathlib import Path
+
 import zipfile
 
 import cli
 from engine import pipeline
+from engine.issues import IssueDiscoveryResult
 
 
 def make_issue_repo_zip(path):
@@ -54,8 +57,10 @@ def test_successful_analysis_shows_issue_matches(monkeypatch, capsys):
     monkeypatch.setattr(pipeline, "download_repo_zip", fake_download)
     monkeypatch.setattr(
         pipeline,
-        "find_first_contribution_issues",
-        lambda owner, repo: [contribution_issue()],
+        "discover_contribution_issues",
+        lambda owner, repo: IssueDiscoveryResult(
+            issues=[contribution_issue()]
+        ),
     )
     monkeypatch.setattr(
         "sys.argv",
@@ -109,3 +114,138 @@ def test_invalid_url_prints_error_and_returns_1(monkeypatch, capsys):
 
     assert cli.main() == 1
     assert "Not a github.com URL" in capsys.readouterr().err
+
+
+def _issue_snapshot(issue_discovery):
+    from engine.discover import DiscoveryResult, DocDiscoveryResult
+    from engine.graph import DependencyGraph
+
+    return pipeline.RepoSnapshot(
+        owner="example",
+        repo="repo",
+        root=Path("."),
+        discovery=DiscoveryResult(),
+        files=[],
+        doc_discovery=DocDiscoveryResult(),
+        graph=DependencyGraph(),
+        contribution_issues=[],
+        issue_file_matches={},
+        issue_doc_matches={},
+        issue_discovery=issue_discovery,
+    )
+
+
+def test_complete_with_zero_issues_reports_no_matches(monkeypatch, capsys):
+    snapshot = _issue_snapshot(
+        {
+            "status": "complete",
+            "complete": True,
+            "issues_found": 0,
+            "scanned_items": 12,
+            "pages_fetched": 12,
+            "warnings": [],
+            "error": None,
+        }
+    )
+    monkeypatch.setattr(
+        cli,
+        "load_repository",
+        lambda url, workdir, fetch_issues=False: snapshot,
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        ["cli.py", "https://github.com/example/repo"],
+    )
+
+    assert cli.main() == 0
+    output = capsys.readouterr().out
+
+    assert "No matching open issues found." in output
+    assert "Issue scan incomplete" not in output
+    assert "Issue discovery failed" not in output
+
+
+def test_budget_exhausted_with_zero_issues_is_not_fatal(monkeypatch, capsys):
+    snapshot = _issue_snapshot(
+        {
+            "status": "budget_exhausted",
+            "complete": False,
+            "issues_found": 0,
+            "scanned_items": 300,
+            "pages_fetched": 8,
+            "warnings": ["scan budget exhausted"],
+            "error": None,
+        }
+    )
+    monkeypatch.setattr(
+        cli,
+        "load_repository",
+        lambda url, workdir, fetch_issues=False: snapshot,
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        ["cli.py", "https://github.com/example/repo"],
+    )
+
+    assert cli.main() == 0
+    output = capsys.readouterr().out
+
+    assert "Issue scan incomplete (scan budget exhausted)." in output
+    assert "Issues found: 0" in output
+    assert "Items scanned: 300" in output
+    assert "No matching open issues found." not in output
+    assert "Issue discovery failed" not in output
+
+
+def test_failed_issue_discovery_with_zero_issues_is_nonzero(
+    monkeypatch,
+    capsys,
+):
+    snapshot = _issue_snapshot(
+        {
+            "status": "failed",
+            "complete": False,
+            "issues_found": 0,
+            "scanned_items": 5,
+            "pages_fetched": 1,
+            "warnings": ["could not fetch contribution issues: HTTP 500"],
+            "error": {"type": "GitHubAPIError", "message": "HTTP 500"},
+        }
+    )
+    monkeypatch.setattr(
+        cli,
+        "load_repository",
+        lambda url, workdir, fetch_issues=False: snapshot,
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        ["cli.py", "https://github.com/example/repo"],
+    )
+
+    assert cli.main() == 1
+    output = capsys.readouterr().out
+
+    assert "Issue discovery failed." in output
+    assert "Issues found before failure: 0" in output
+    assert "Items scanned: 5" in output
+    assert "No matching open issues found." not in output
+
+
+def test_fetch_issues_disabled_preserves_normal_output(monkeypatch, capsys):
+    snapshot = _issue_snapshot(None)
+    monkeypatch.setattr(
+        cli,
+        "load_repository",
+        lambda url, workdir, fetch_issues=False: snapshot,
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        ["cli.py", "https://github.com/example/repo"],
+    )
+
+    assert cli.main() == 0
+    output = capsys.readouterr().out
+
+    assert "No matching open issues found." in output
+    assert "Issue scan incomplete" not in output
+    assert "Issue discovery failed" not in output

@@ -92,6 +92,38 @@ def main() -> int:
                 print("\nNo reading path could be generated.")
 
             print("\nBeginner-friendly contribution issues:")
+            issue_discovery = snapshot.issue_discovery
+            issue_status = (
+                issue_discovery.get("status")
+                if issue_discovery
+                else None
+            )
+            issue_failure = issue_status == "failed"
+
+            if issue_status == "failed":
+                scanned_items = (
+                    issue_discovery.get("scanned_items", 0)
+                    if issue_discovery
+                    else 0
+                )
+                print("  Issue discovery failed.")
+                print(
+                    "  Issues found before failure: "
+                    f"{len(snapshot.contribution_issues)}"
+                )
+                print(f"  Items scanned: {scanned_items}")
+            elif issue_status == "budget_exhausted":
+                scanned_items = (
+                    issue_discovery.get("scanned_items", 0)
+                    if issue_discovery
+                    else 0
+                )
+                print("  Issue scan incomplete (scan budget exhausted).")
+                print(
+                    "  Issues found: "
+                    f"{len(snapshot.contribution_issues)}"
+                )
+                print(f"  Items scanned: {scanned_items}")
 
             if snapshot.contribution_issues:
                 for issue in snapshot.contribution_issues:
@@ -142,7 +174,14 @@ def main() -> int:
                             "found with enough evidence."
                         )
             else:
-                print("  No matching open issues found.")
+                if issue_status == "failed":
+                    pass
+                elif issue_status == "budget_exhausted":
+                    print(
+                        "  No issues were found before scan stopped."
+                    )
+                else:
+                    print("  No matching open issues found.")
 
             if discovered_files:
                 print("\nPython files:")
@@ -161,6 +200,9 @@ def main() -> int:
 
     except EXPECTED_ERRORS as exc:
         print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if issue_failure:
         return 1
 
     return 0
