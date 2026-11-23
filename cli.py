@@ -24,10 +24,19 @@ EXPECTED_ERRORS = (
 )
 
 
+def _print_help() -> None:
+    print("RepoCompass - Analyze a GitHub Python repository")
+    print()
+    print("Usage: python cli.py <github-url>")
+    print()
+    print("Arguments:")
+    print("  <github-url>  Public GitHub repository URL to analyze")
+
+
 def main() -> int:
-    if len(sys.argv) != 2:
-        print("Usage: python cli.py <github-url>")
-        return 2
+    if len(sys.argv) != 2 or sys.argv[1] in ("-h", "--help"):
+        _print_help()
+        return 0 if len(sys.argv) == 2 else 2
 
     repo_url = sys.argv[1]
 

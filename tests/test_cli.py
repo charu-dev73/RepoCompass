@@ -106,6 +106,17 @@ def test_no_arguments_prints_usage_and_returns_2(monkeypatch, capsys):
     assert "Usage" in capsys.readouterr().out
 
 
+def test_help_flag_prints_usage_and_returns_0(monkeypatch, capsys):
+    for flag in ("-h", "--help"):
+        monkeypatch.setattr("sys.argv", ["cli.py", flag])
+
+        assert cli.main() == 0
+        output = capsys.readouterr().out
+        assert "Usage: python cli.py <github-url>" in output
+        assert "<github-url>" in output
+        assert "Analyze a GitHub Python repository" in output
+
+
 def test_invalid_url_prints_error_and_returns_1(monkeypatch, capsys):
     monkeypatch.setattr(
         "sys.argv",
