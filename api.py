@@ -1,9 +1,12 @@
 """HTTP API for RepoCompass repository analysis."""
 
 from dataclasses import asdict, is_dataclass
+from email.utils import parsedate_to_datetime
 import json
 from http import HTTPStatus
+import os
 from pathlib import Path
+import re
 import tempfile
 import threading
 from typing import Any, Callable
@@ -126,6 +129,291 @@ def _error_response(
     )
 
 
+_SAFE_FAILURE_WARNING = "Could not fetch contribution issues"
+_SAFE_FAILURE_ERROR = {
+    "type": "IssueDiscoveryError",
+    "message": "Contribution issue discovery failed",
+    "status_code": None,
+    "retry_after": None,
+    "rate_limit_reset": None,
+}
+_SAFE_ISSUE_DISCOVERY_FAILURE = {
+    "status": "failed",
+    "complete": False,
+    "issues_found": 0,
+    "scanned_items": 0,
+    "pages_fetched": 0,
+    "warnings": [_SAFE_FAILURE_WARNING],
+    "error": dict(_SAFE_FAILURE_ERROR),
+}
+
+_CANDIDATE_SOURCE_NAMES = frozenset(
+    {
+        "label 'good first issue'",
+        "label 'good-first-issue'",
+        "label 'good_first_issue'",
+        "label 'beginner'",
+        "label 'first timers only'",
+        "label 'first-timers-only'",
+        "label 'first_timers_only'",
+        "label 'help wanted'",
+        "label 'help-wanted'",
+        "label 'help_wanted'",
+        "label 'easy'",
+        "mixed title fallback",
+    }
+)
+_KNOWN_ISSUE_DISCOVERY_ERROR_TYPES = frozenset(
+    {"GitHubAPIError", "RepositoryNotFound"}
+)
+_BUDGET_WARNING_RE = re.compile(
+    r"^contribution issue scan stopped after (\d+) items "
+    r"because the scan budget \((\d+)\) was exhausted$"
+)
+_SOURCE_WARNING_RE = re.compile(
+    r"^contribution candidate scan for (.+) stopped after (\d+) items "
+    r"while more candidates were available$"
+)
+_ASCII_DIGITS_RE = re.compile(r"^[0-9]+$")
+_IMF_FIXDATE_RE = re.compile(
+    r"^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), "
+    r"[0-9]{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [0-9]{4} "
+    r"[0-9]{2}:[0-9]{2}:[0-9]{2} GMT$"
+)
+_RFC850_DATE_RE = re.compile(
+    r"^(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), "
+    r"[0-9]{2}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-[0-9]{2} "
+    r"[0-9]{2}:[0-9]{2}:[0-9]{2} GMT$"
+)
+_ASCTIME_DATE_RE = re.compile(
+    r"^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) "
+    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+    r"(?:[0-9]{2}| [0-9]) [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4}$"
+)
+
+
+def _is_safe_issue_warning(warning: str) -> bool:
+    # Preserve only known engine-generated, non-diagnostic warnings.
+    if _BUDGET_WARNING_RE.fullmatch(warning) is not None:
+        return True
+
+    source_match = _SOURCE_WARNING_RE.fullmatch(warning)
+    if source_match is None:
+        return False
+
+    return source_match.group(1) in _CANDIDATE_SOURCE_NAMES
+
+
+def _sanitize_status_code(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if 100 <= value <= 599:
+        return value
+    return None
+
+
+def _is_valid_http_date(value: str) -> bool:
+    if (
+        _IMF_FIXDATE_RE.fullmatch(value) is None
+        and _RFC850_DATE_RE.fullmatch(value) is None
+        and _ASCTIME_DATE_RE.fullmatch(value) is None
+    ):
+        return False
+
+    try:
+        parsed = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError):
+        return False
+
+    return parsed is not None
+
+
+def _sanitize_retry_after(value: Any) -> int | str | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        if value >= 0:
+            return value
+        return None
+    if not isinstance(value, str):
+        return None
+    if _ASCII_DIGITS_RE.fullmatch(value):
+        return value
+    if _is_valid_http_date(value):
+        return value
+    return None
+
+
+def _sanitize_rate_limit_reset(value: Any) -> str | None:
+    if isinstance(value, str) and _ASCII_DIGITS_RE.fullmatch(value):
+        return value
+    return None
+
+
+def _sanitize_issue_discovery_error(error: Any) -> dict[str, Any]:
+    if not isinstance(error, dict):
+        return dict(_SAFE_FAILURE_ERROR)
+
+    sanitized_error = dict(_SAFE_FAILURE_ERROR)
+    error_type = error.get("type")
+    if (
+        isinstance(error_type, str)
+        and error_type in _KNOWN_ISSUE_DISCOVERY_ERROR_TYPES
+    ):
+        sanitized_error["type"] = error_type
+
+    sanitized_error["status_code"] = _sanitize_status_code(
+        error.get("status_code")
+    )
+    sanitized_error["retry_after"] = _sanitize_retry_after(
+        error.get("retry_after")
+    )
+    sanitized_error["rate_limit_reset"] = _sanitize_rate_limit_reset(
+        error.get("rate_limit_reset")
+    )
+    return sanitized_error
+
+
+def _sanitize_issue_discovery_warnings(warnings: Any) -> list[str]:
+    if not isinstance(warnings, list):
+        return [_SAFE_FAILURE_WARNING]
+
+    sanitized_warnings = []
+    for warning in warnings:
+        if not isinstance(warning, str):
+            continue
+        if "/" in warning or "\\" in warning:
+            continue
+        if "could not fetch contribution issues" in warning.lower():
+            continue
+        if _is_safe_issue_warning(warning):
+            sanitized_warnings.append(warning)
+
+    if not sanitized_warnings:
+        return [_SAFE_FAILURE_WARNING]
+
+    return sanitized_warnings
+
+
+_KNOWN_ISSUE_DISCOVERY_STATUSES = frozenset(
+    {"complete", "budget_exhausted", "failed"}
+)
+
+
+def _sanitize_non_negative_int(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    if value < 0:
+        return 0
+    return value
+
+
+def _sanitize_issue_discovery_status(value: Any) -> str | None:
+    if isinstance(value, str) and value in _KNOWN_ISSUE_DISCOVERY_STATUSES:
+        return value
+    return None
+
+
+def _sanitize_issue_discovery_complete(
+    value: Any,
+    status: str,
+) -> bool:
+    expected = status == "complete"
+    if isinstance(value, bool):
+        return value if value == expected else expected
+    return expected
+
+
+def _sanitize_issue_discovery_error_for_status(
+    error: Any,
+    status: str,
+) -> dict[str, Any] | None:
+    if status != "failed":
+        return None
+    return _sanitize_issue_discovery_error(error)
+
+
+def _sanitize_issue_discovery_warnings_for_status(
+    warnings: Any,
+    status: str,
+) -> list[str]:
+    if status == "failed":
+        return _sanitize_issue_discovery_warnings(warnings)
+
+    if not isinstance(warnings, list):
+        return []
+
+    sanitized_warnings = []
+    for warning in warnings:
+        if not isinstance(warning, str):
+            continue
+        if "/" in warning or "\\" in warning:
+            continue
+        if "could not fetch contribution issues" in warning.lower():
+            continue
+        if _is_safe_issue_warning(warning):
+            sanitized_warnings.append(warning)
+
+    return sanitized_warnings
+
+
+def _sanitize_issue_discovery(
+    issue_discovery: Any,
+) -> Any:
+    if issue_discovery is None:
+        return None
+
+    if not isinstance(issue_discovery, dict):
+        return dict(_SAFE_ISSUE_DISCOVERY_FAILURE)
+
+    status = _sanitize_issue_discovery_status(issue_discovery.get("status"))
+    if status is None:
+        return {
+            "status": "failed",
+            "complete": False,
+            "issues_found": _sanitize_non_negative_int(
+                issue_discovery.get("issues_found")
+            ),
+            "scanned_items": _sanitize_non_negative_int(
+                issue_discovery.get("scanned_items")
+            ),
+            "pages_fetched": _sanitize_non_negative_int(
+                issue_discovery.get("pages_fetched")
+            ),
+            "warnings": _sanitize_issue_discovery_warnings(
+                issue_discovery.get("warnings")
+            ),
+            "error": _sanitize_issue_discovery_error(
+                issue_discovery.get("error")
+            ),
+        }
+
+    return {
+        "status": status,
+        "complete": _sanitize_issue_discovery_complete(
+            issue_discovery.get("complete"),
+            status,
+        ),
+        "issues_found": _sanitize_non_negative_int(
+            issue_discovery.get("issues_found")
+        ),
+        "scanned_items": _sanitize_non_negative_int(
+            issue_discovery.get("scanned_items")
+        ),
+        "pages_fetched": _sanitize_non_negative_int(
+            issue_discovery.get("pages_fetched")
+        ),
+        "warnings": _sanitize_issue_discovery_warnings_for_status(
+            issue_discovery.get("warnings"),
+            status,
+        ),
+        "error": _sanitize_issue_discovery_error_for_status(
+            issue_discovery.get("error"),
+            status,
+        ),
+    }
+
+
 def _snapshot_payload(snapshot: RepoSnapshot) -> dict[str, Any]:
     return {
         "owner": snapshot.owner,
@@ -136,7 +424,9 @@ def _snapshot_payload(snapshot: RepoSnapshot) -> dict[str, Any]:
         "contribution_issues": snapshot.contribution_issues,
         "issue_file_matches": snapshot.issue_file_matches,
         "issue_doc_matches": snapshot.issue_doc_matches,
-        "issue_discovery": snapshot.issue_discovery,
+        "issue_discovery": _sanitize_issue_discovery(
+            snapshot.issue_discovery
+        ),
     }
 
 
@@ -305,39 +595,43 @@ class RepoCompassAPI:
                 max_body_bytes=self._max_response_bytes,
             )
 
-        except InvalidGitHubURL as exc:
+        except InvalidGitHubURL:
             return _error_response(
                 start_response,
                 HTTPStatus.BAD_REQUEST,
-                str(exc),
+                "Invalid GitHub repository URL",
                 max_body_bytes=self._max_response_bytes,
             )
 
-        except RepositoryNotFound as exc:
+        except RepositoryNotFound:
             return _error_response(
                 start_response,
                 HTTPStatus.NOT_FOUND,
-                str(exc),
+                "Repository not found or not public",
                 max_body_bytes=self._max_response_bytes,
             )
 
-        except (
-            RepositoryTooLarge,
-            InvalidArchiveError,
-            UnsafeArchiveError,
-        ) as exc:
+        except RepositoryTooLarge:
             return _error_response(
                 start_response,
                 HTTPStatus.UNPROCESSABLE_ENTITY,
-                str(exc),
+                "Repository is too large to analyze",
                 max_body_bytes=self._max_response_bytes,
             )
 
-        except GitHubAPIError as exc:
+        except (InvalidArchiveError, UnsafeArchiveError):
+            return _error_response(
+                start_response,
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "Repository archive is invalid or unsafe",
+                max_body_bytes=self._max_response_bytes,
+            )
+
+        except GitHubAPIError:
             return _error_response(
                 start_response,
                 HTTPStatus.BAD_GATEWAY,
-                str(exc),
+                "Upstream GitHub request failed",
                 max_body_bytes=self._max_response_bytes,
             )
 
@@ -373,7 +667,40 @@ def create_app(
 app = create_app()
 
 
-def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
+def _resolve_serve_address(
+    host: str | None = None,
+    port: int | str | None = None,
+) -> tuple[str, int]:
+    """Resolve host/port for serve() using explicit args, env vars, or defaults."""
+    resolved_host = (
+        host if host is not None else os.environ.get("HOST", "127.0.0.1")
+    )
+
+    if port is None:
+        port_value: int | str = os.environ.get("PORT", "8000")
+    else:
+        port_value = port
+
+    if isinstance(port_value, bool):
+        raise ValueError("Invalid port: must be an integer between 1 and 65535")
+
+    try:
+        resolved_port = int(port_value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid port: {port_value!r}") from None
+
+    if not 1 <= resolved_port <= 65535:
+        raise ValueError(
+            f"Invalid port: {resolved_port} (must be between 1 and 65535)"
+        )
+
+    return resolved_host, resolved_port
+
+
+def serve(
+    host: str | None = None,
+    port: int | str | None = None,
+) -> None:
     """Run the RepoCompass API with a threaded WSGI server."""
     from socketserver import ThreadingMixIn
     from wsgiref.simple_server import (
@@ -382,12 +709,14 @@ def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
         make_server,
     )
 
+    resolved_host, resolved_port = _resolve_serve_address(host, port)
+
     class ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
         daemon_threads = True
 
     with make_server(
-        host,
-        port,
+        resolved_host,
+        resolved_port,
         app,
         server_class=ThreadingWSGIServer,
         handler_class=WSGIRequestHandler,

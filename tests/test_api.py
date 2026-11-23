@@ -1,10 +1,13 @@
 import io
 import json
+import os
 from pathlib import Path
 import threading
 from urllib.parse import urlencode
 
-from api import create_app
+import pytest
+
+from api import _resolve_serve_address, app, create_app, serve
 from engine.discover import DiscoveryResult
 from engine.fetch import (
     GitHubAPIError,
@@ -222,7 +225,21 @@ def test_analyze_reports_incomplete_issue_discovery():
             "labels": ["good first issue"],
         }
     ]
-    assert payload["issue_discovery"] == snapshot.issue_discovery
+    assert payload["issue_discovery"]["status"] == "failed"
+    assert payload["issue_discovery"]["complete"] is False
+    assert payload["issue_discovery"]["issues_found"] == 1
+    assert payload["issue_discovery"]["scanned_items"] == 30
+    assert payload["issue_discovery"]["pages_fetched"] == 1
+    assert payload["issue_discovery"]["warnings"] == [
+        "Could not fetch contribution issues"
+    ]
+    assert payload["issue_discovery"]["error"] == {
+        "type": "GitHubAPIError",
+        "message": "Contribution issue discovery failed",
+        "status_code": 500,
+        "retry_after": None,
+        "rate_limit_reset": None,
+    }
 
 
 def test_analyze_reports_budget_exhausted_issue_discovery():
@@ -233,7 +250,10 @@ def test_analyze_reports_budget_exhausted_issue_discovery():
         "issues_found": 1,
         "scanned_items": 300,
         "pages_fetched": 3,
-        "warnings": ["scan budget exhausted"],
+        "warnings": [
+            "contribution issue scan stopped after 300 items "
+            "because the scan budget (300) was exhausted"
+        ],
         "error": None,
     }
 
@@ -292,7 +312,7 @@ def test_analyze_rejects_invalid_url():
         "error": "Missing required query parameter: url"
     }
     assert invalid_status == 400
-    assert invalid_payload == {"error": "Not a github.com URL"}
+    assert invalid_payload == {"error": "Invalid GitHub repository URL"}
 
 
 def test_analyze_returns_not_found_for_missing_repository():
@@ -309,9 +329,7 @@ def test_analyze_returns_not_found_for_missing_repository():
     )
 
     assert status == 404
-    assert payload == {
-        "error": "example/repo not found, or it is not public"
-    }
+    assert payload == {"error": "Repository not found or not public"}
 
 
 def test_analyze_maps_upstream_and_internal_errors():
@@ -335,7 +353,7 @@ def test_analyze_maps_upstream_and_internal_errors():
     )
 
     assert upstream_status == 502
-    assert upstream_payload == {"error": "GitHub API unavailable"}
+    assert upstream_payload == {"error": "Upstream GitHub request failed"}
     assert internal_status == 500
     assert internal_payload == {"error": "Internal server error"}
 
@@ -410,10 +428,18 @@ def test_analyze_limits_concurrent_analyses_to_two():
 def test_analyze_maps_archive_and_size_errors():
     def analyzer(url, workdir, fetch_issues=False):
         if url.endswith("/too-large"):
-            raise RepositoryTooLarge("Repository exceeds size limit")
+            raise RepositoryTooLarge(
+                "Repository /private/tmp/repocompass exceeds size limit"
+            )
         if url.endswith("/invalid"):
-            raise InvalidArchiveError("Downloaded file is not a valid ZIP archive")
-        raise UnsafeArchiveError("Archive contains unsafe paths")
+            raise InvalidArchiveError(
+                "Downloaded file is not a valid ZIP archive: "
+                "/tmp/repocompass-api-abc/repo.zip"
+            )
+        raise UnsafeArchiveError(
+            "Extraction would follow an existing symbolic link: "
+            "/tmp/repocompass-api-abc/extracted/project"
+        )
 
     app = create_app(analyzer=analyzer)
 
@@ -434,13 +460,725 @@ def test_analyze_maps_archive_and_size_errors():
     )
 
     assert too_large_status == 422
-    assert too_large_payload == {"error": "Repository exceeds size limit"}
+    assert too_large_payload == {"error": "Repository is too large to analyze"}
     assert invalid_status == 422
     assert invalid_payload == {
-        "error": "Downloaded file is not a valid ZIP archive"
+        "error": "Repository archive is invalid or unsafe"
     }
     assert unsafe_status == 422
-    assert unsafe_payload == {"error": "Archive contains unsafe paths"}
+    assert unsafe_payload == {
+        "error": "Repository archive is invalid or unsafe"
+    }
+    assert "repocompass" not in str(too_large_payload)
+    assert "/tmp" not in str(invalid_payload)
+    assert "/tmp" not in str(unsafe_payload)
+
+
+def test_analyze_sanitizes_failed_issue_discovery_payload():
+    snapshot = make_snapshot()
+    snapshot.issue_discovery = {
+        "status": "failed",
+        "complete": False,
+        "issues_found": 1,
+        "scanned_items": 30,
+        "pages_fetched": 1,
+        "warnings": [
+            "could not fetch contribution issues: "
+            "Could not reach GitHub: /tmp/socket-trace",
+            "partial results preserved",
+        ],
+        "error": {
+            "type": "GitHubAPIError",
+            "message": "Could not reach GitHub: "
+            "httpx.ConnectError('/private/tmp/proxy')",
+            "status_code": None,
+            "retry_after": "60",
+            "rate_limit_reset": None,
+        },
+    }
+
+    app = create_app(analyzer=lambda url, workdir, fetch_issues: snapshot)
+    status, _, payload = call_api(
+        app,
+        "/analyze",
+        {"url": "https://github.com/example/repo"},
+    )
+
+    assert status == 502
+    assert payload["owner"] == "example"
+    assert payload["repo"] == "repo"
+    assert payload["contribution_issues"] == snapshot.contribution_issues
+    assert payload["issue_discovery"]["status"] == "failed"
+    assert payload["issue_discovery"]["complete"] is False
+    assert payload["issue_discovery"]["issues_found"] == 1
+    assert payload["issue_discovery"]["scanned_items"] == 30
+    assert payload["issue_discovery"]["pages_fetched"] == 1
+    assert payload["issue_discovery"]["warnings"] == [
+        "Could not fetch contribution issues"
+    ]
+    assert payload["issue_discovery"]["error"]["type"] == "GitHubAPIError"
+    assert payload["issue_discovery"]["error"]["message"] == (
+        "Contribution issue discovery failed"
+    )
+    assert payload["issue_discovery"]["error"]["retry_after"] == "60"
+    assert "/tmp" not in json.dumps(payload)
+    assert "httpx" not in json.dumps(payload)
+
+
+def test_analyze_sanitizes_failed_issue_discovery_malformed_variants():
+    sensitive = "/tmp/socket-trace httpx.ConnectError('/private/tmp/proxy')"
+    cases = [
+        {
+            "issue_discovery": {
+                "status": "failed",
+                "complete": False,
+                "issues_found": 2,
+                "scanned_items": 12,
+                "pages_fetched": 1,
+                "warnings": ["partial results preserved"],
+                "error": sensitive,
+            },
+            "expected_error": {
+                "type": "IssueDiscoveryError",
+                "message": "Contribution issue discovery failed",
+                "status_code": None,
+                "retry_after": None,
+                "rate_limit_reset": None,
+            },
+            "expected_warnings": ["Could not fetch contribution issues"],
+        },
+        {
+            "issue_discovery": {
+                "status": "failed",
+                "complete": False,
+                "issues_found": 1,
+                "scanned_items": 9,
+                "pages_fetched": 1,
+                "error": {
+                    "type": "GitHubAPIError",
+                    "message": sensitive,
+                    "status_code": 502,
+                },
+            },
+            "expected_error": {
+                "type": "GitHubAPIError",
+                "message": "Contribution issue discovery failed",
+                "status_code": 502,
+                "retry_after": None,
+                "rate_limit_reset": None,
+            },
+            "expected_warnings": ["Could not fetch contribution issues"],
+        },
+        {
+            "issue_discovery": {
+                "status": "failed",
+                "complete": False,
+                "issues_found": 1,
+                "scanned_items": 9,
+                "pages_fetched": 1,
+                "warnings": "trace at /tmp/socket-trace",
+                "error": None,
+            },
+            "expected_error": {
+                "type": "IssueDiscoveryError",
+                "message": "Contribution issue discovery failed",
+                "status_code": None,
+                "retry_after": None,
+                "rate_limit_reset": None,
+            },
+            "expected_warnings": ["Could not fetch contribution issues"],
+        },
+        {
+            "issue_discovery": {
+                "status": "failed",
+                "complete": False,
+                "issues_found": 1,
+                "scanned_items": 9,
+                "pages_fetched": 1,
+                "warnings": [
+                    {
+                        "detail": "httpx.ConnectError",
+                        "path": "/tmp/socket-trace",
+                    },
+                    7,
+                ],
+                "error": {"message": sensitive},
+            },
+            "expected_error": {
+                "type": "IssueDiscoveryError",
+                "message": "Contribution issue discovery failed",
+                "status_code": None,
+                "retry_after": None,
+                "rate_limit_reset": None,
+            },
+            "expected_warnings": ["Could not fetch contribution issues"],
+        },
+        {
+            "issue_discovery": {
+                "status": "failed",
+                "complete": False,
+                "issues_found": 1,
+                "scanned_items": 9,
+                "pages_fetched": 1,
+                "warnings": [
+                    "upstream trace: httpx.ConnectError('/tmp/socket')",
+                    "Could not reach GitHub: /private/tmp/proxy",
+                ],
+                "error": {
+                    "type": "GitHubAPIError",
+                    "message": sensitive,
+                },
+            },
+            "expected_error": {
+                "type": "GitHubAPIError",
+                "message": "Contribution issue discovery failed",
+                "status_code": None,
+                "retry_after": None,
+                "rate_limit_reset": None,
+            },
+            "expected_warnings": ["Could not fetch contribution issues"],
+        },
+    ]
+
+    for case in cases:
+        snapshot = make_snapshot()
+        snapshot.issue_discovery = case["issue_discovery"]
+
+        app = create_app(
+            analyzer=lambda url, workdir, fetch_issues, snapshot=snapshot: snapshot
+        )
+        status, _, payload = call_api(
+            app,
+            "/analyze",
+            {"url": "https://github.com/example/repo"},
+        )
+
+        assert status == 502
+        assert payload["owner"] == "example"
+        assert payload["repo"] == "repo"
+        assert payload["contribution_issues"] == snapshot.contribution_issues
+        assert payload["issue_discovery"]["status"] == "failed"
+        assert payload["issue_discovery"]["complete"] is False
+        assert payload["issue_discovery"]["issues_found"] == case[
+            "issue_discovery"
+        ]["issues_found"]
+        assert payload["issue_discovery"]["scanned_items"] == case[
+            "issue_discovery"
+        ]["scanned_items"]
+        assert payload["issue_discovery"]["pages_fetched"] == case[
+            "issue_discovery"
+        ]["pages_fetched"]
+        assert payload["issue_discovery"]["error"] == case["expected_error"]
+        assert payload["issue_discovery"]["warnings"] == case[
+            "expected_warnings"
+        ]
+
+        serialized = json.dumps(payload)
+        assert "/tmp" not in serialized
+        assert "/private/tmp" not in serialized
+        assert "httpx" not in serialized
+        assert "socket-trace" not in serialized
+        assert "ConnectError" not in serialized
+
+
+def test_analyze_sanitizes_non_dictionary_issue_discovery():
+    snapshot = make_snapshot()
+    snapshot.issue_discovery = "could not fetch: /tmp/socket-trace httpx"
+
+    app = create_app(analyzer=lambda url, workdir, fetch_issues: snapshot)
+    status, _, payload = call_api(
+        app,
+        "/analyze",
+        {"url": "https://github.com/example/repo"},
+    )
+
+    assert status == 502
+    assert payload["owner"] == "example"
+    assert payload["repo"] == "repo"
+    assert payload["issue_discovery"] == {
+        "status": "failed",
+        "complete": False,
+        "issues_found": 0,
+        "scanned_items": 0,
+        "pages_fetched": 0,
+        "warnings": ["Could not fetch contribution issues"],
+        "error": {
+            "type": "IssueDiscoveryError",
+            "message": "Contribution issue discovery failed",
+            "status_code": None,
+            "retry_after": None,
+            "rate_limit_reset": None,
+        },
+    }
+
+    serialized = json.dumps(payload)
+    assert "/tmp" not in serialized
+    assert "httpx" not in serialized
+    assert "socket-trace" not in serialized
+
+
+def test_analyze_sanitizes_issue_discovery_warning_and_error_strictly():
+    sensitive = "httpx.ConnectError('/tmp/socket-trace')"
+    snapshot = make_snapshot()
+    snapshot.issue_discovery = {
+        "status": "failed",
+        "complete": False,
+        "issues_found": 1,
+        "scanned_items": 30,
+        "pages_fetched": 1,
+        "warnings": [
+            "contribution candidate scan for label "
+            f"'{sensitive}' stopped after 10 items while more "
+            "candidates were available",
+            "contribution issue scan stopped after 30 "
+            f"{sensitive} items because the scan budget (300) "
+            "was exhausted",
+            "contribution issue scan stopped after 30 items "
+            "because the scan budget (300) was exhausted",
+            "contribution candidate scan for mixed title fallback "
+            "stopped after 5 items while more candidates were "
+            "available",
+        ],
+        "error": {
+            "type": f"httpx.ConnectError('{sensitive}')",
+            "message": sensitive,
+            "status_code": 502,
+            "retry_after": "60",
+            "rate_limit_reset": "/tmp/reset",
+        },
+    }
+
+    app = create_app(analyzer=lambda url, workdir, fetch_issues: snapshot)
+    status, _, payload = call_api(
+        app,
+        "/analyze",
+        {"url": "https://github.com/example/repo"},
+    )
+
+    assert status == 502
+    assert payload["issue_discovery"]["status"] == "failed"
+    assert payload["issue_discovery"]["complete"] is False
+    assert payload["issue_discovery"]["issues_found"] == 1
+    assert payload["issue_discovery"]["scanned_items"] == 30
+    assert payload["issue_discovery"]["pages_fetched"] == 1
+    assert payload["issue_discovery"]["warnings"] == [
+        "contribution issue scan stopped after 30 items "
+        "because the scan budget (300) was exhausted",
+        "contribution candidate scan for mixed title fallback "
+        "stopped after 5 items while more candidates were "
+        "available",
+    ]
+    assert payload["issue_discovery"]["error"] == {
+        "type": "IssueDiscoveryError",
+        "message": "Contribution issue discovery failed",
+        "status_code": 502,
+        "retry_after": "60",
+        "rate_limit_reset": None,
+    }
+
+    serialized = json.dumps(payload)
+    assert "httpx" not in serialized
+    assert "/tmp" not in serialized
+    assert "/private/tmp" not in serialized
+    assert "socket-trace" not in serialized
+    assert "ConnectError" not in serialized
+
+
+def test_analyze_sanitizes_issue_discovery_metadata_fields():
+    diagnostic = "httpx.ConnectError"
+
+    cases = [
+        {
+            "error": {
+                "type": "GitHubAPIError",
+                "message": diagnostic,
+                "status_code": diagnostic,
+                "retry_after": "120",
+                "rate_limit_reset": "1712345678",
+            },
+            "expected": {
+                "type": "GitHubAPIError",
+                "message": "Contribution issue discovery failed",
+                "status_code": None,
+                "retry_after": "120",
+                "rate_limit_reset": "1712345678",
+            },
+        },
+        {
+            "error": {
+                "type": "GitHubAPIError",
+                "message": diagnostic,
+                "status_code": 429,
+                "retry_after": diagnostic,
+                "rate_limit_reset": "1712345678",
+            },
+            "expected": {
+                "type": "GitHubAPIError",
+                "message": "Contribution issue discovery failed",
+                "status_code": 429,
+                "retry_after": None,
+                "rate_limit_reset": "1712345678",
+            },
+        },
+        {
+            "error": {
+                "type": "GitHubAPIError",
+                "message": diagnostic,
+                "status_code": 429,
+                "retry_after": "Wed, 21 Oct 2015 07:28:00 GMT",
+                "rate_limit_reset": diagnostic,
+            },
+            "expected": {
+                "type": "GitHubAPIError",
+                "message": "Contribution issue discovery failed",
+                "status_code": 429,
+                "retry_after": "Wed, 21 Oct 2015 07:28:00 GMT",
+                "rate_limit_reset": None,
+            },
+        },
+    ]
+
+    for case in cases:
+        snapshot = make_snapshot()
+        snapshot.issue_discovery = {
+            "status": "failed",
+            "complete": False,
+            "issues_found": 1,
+            "scanned_items": 30,
+            "pages_fetched": 1,
+            "warnings": ["Could not fetch contribution issues"],
+            "error": case["error"],
+        }
+
+        app = create_app(
+            analyzer=lambda url, workdir, fetch_issues, snapshot=snapshot: snapshot
+        )
+        status, _, payload = call_api(
+            app,
+            "/analyze",
+            {"url": "https://github.com/example/repo"},
+        )
+
+        assert status == 502
+        assert payload["issue_discovery"]["error"] == case["expected"]
+
+        serialized = json.dumps(payload)
+        assert "httpx" not in serialized
+        assert "ConnectError" not in serialized
+        assert "/tmp" not in serialized
+        assert "/private/tmp" not in serialized
+
+
+def test_analyze_sanitizes_retry_after_and_rate_limit_reset_formats():
+    malformed_parseable_date = "Tue, 01 Jan 2019 00:00:00 +0000"
+    unicode_digits = "\u0661\u0662\u0663"
+
+    cases = [
+        {
+            "error": {
+                "type": "GitHubAPIError",
+                "message": "x",
+                "status_code": 429,
+                "retry_after": malformed_parseable_date,
+                "rate_limit_reset": "1712345678",
+            },
+            "expected": {
+                "type": "GitHubAPIError",
+                "message": "Contribution issue discovery failed",
+                "status_code": 429,
+                "retry_after": None,
+                "rate_limit_reset": "1712345678",
+            },
+        },
+        {
+            "error": {
+                "type": "GitHubAPIError",
+                "message": "x",
+                "status_code": 429,
+                "retry_after": "Wed, 21 Oct 2015 07:28:00 GMT",
+                "rate_limit_reset": "1712345678",
+            },
+            "expected": {
+                "type": "GitHubAPIError",
+                "message": "Contribution issue discovery failed",
+                "status_code": 429,
+                "retry_after": "Wed, 21 Oct 2015 07:28:00 GMT",
+                "rate_limit_reset": "1712345678",
+            },
+        },
+        {
+            "error": {
+                "type": "GitHubAPIError",
+                "message": "x",
+                "status_code": 429,
+                "retry_after": "Wed, 2\u0661 Oct 2015 07:28:00 GMT",
+                "rate_limit_reset": "1712345678",
+            },
+            "expected": {
+                "type": "GitHubAPIError",
+                "message": "Contribution issue discovery failed",
+                "status_code": 429,
+                "retry_after": None,
+                "rate_limit_reset": "1712345678",
+            },
+        },
+        {
+            "error": {
+                "type": "GitHubAPIError",
+                "message": "x",
+                "status_code": 429,
+                "retry_after": "120",
+                "rate_limit_reset": "1712345678",
+            },
+            "expected": {
+                "type": "GitHubAPIError",
+                "message": "Contribution issue discovery failed",
+                "status_code": 429,
+                "retry_after": "120",
+                "rate_limit_reset": "1712345678",
+            },
+        },
+        {
+            "error": {
+                "type": "GitHubAPIError",
+                "message": "x",
+                "status_code": 429,
+                "retry_after": unicode_digits,
+                "rate_limit_reset": unicode_digits,
+            },
+            "expected": {
+                "type": "GitHubAPIError",
+                "message": "Contribution issue discovery failed",
+                "status_code": 429,
+                "retry_after": None,
+                "rate_limit_reset": None,
+            },
+        },
+    ]
+
+    for case in cases:
+        snapshot = make_snapshot()
+        snapshot.issue_discovery = {
+            "status": "failed",
+            "complete": False,
+            "issues_found": 1,
+            "scanned_items": 30,
+            "pages_fetched": 1,
+            "warnings": ["Could not fetch contribution issues"],
+            "error": case["error"],
+        }
+
+        app = create_app(
+            analyzer=lambda url, workdir, fetch_issues, snapshot=snapshot: snapshot
+        )
+        status, _, payload = call_api(
+            app,
+            "/analyze",
+            {"url": "https://github.com/example/repo"},
+        )
+
+        assert status == 502
+        assert payload["issue_discovery"]["error"] == case["expected"]
+
+
+def test_analyze_failed_issue_discovery_omits_unexpected_fields():
+    snapshot = make_snapshot()
+    snapshot.issue_discovery = {
+        "status": "failed",
+        "complete": False,
+        "issues_found": 2,
+        "scanned_items": 9,
+        "pages_fetched": 1,
+        "warnings": ["Could not fetch contribution issues"],
+        "error": {
+            "type": "GitHubAPIError",
+            "message": "Contribution issue discovery failed",
+            "status_code": 502,
+            "retry_after": "30",
+            "rate_limit_reset": "1712345678",
+            "token": "ghp_secret",
+            "path": "/tmp/secret",
+        },
+        "internal_path": "/tmp/repocompass-api-abc/repo.zip",
+        "debug_trace": "httpx.ConnectError('/private/tmp/proxy')",
+        "authorization": "Bearer secret-token",
+    }
+
+    app = create_app(analyzer=lambda url, workdir, fetch_issues: snapshot)
+    status, _, payload = call_api(
+        app,
+        "/analyze",
+        {"url": "https://github.com/example/repo"},
+    )
+
+    assert status == 502
+    assert payload["issue_discovery"] == {
+        "status": "failed",
+        "complete": False,
+        "issues_found": 2,
+        "scanned_items": 9,
+        "pages_fetched": 1,
+        "warnings": ["Could not fetch contribution issues"],
+        "error": {
+            "type": "GitHubAPIError",
+            "message": "Contribution issue discovery failed",
+            "status_code": 502,
+            "retry_after": "30",
+            "rate_limit_reset": "1712345678",
+        },
+    }
+    serialized = json.dumps(payload)
+    assert "/tmp" not in serialized
+    assert "/private/tmp" not in serialized
+    assert "ghp_secret" not in serialized
+    assert "Bearer secret-token" not in serialized
+    assert "httpx" not in serialized
+    assert "ConnectError" not in serialized
+
+
+def test_analyze_complete_issue_discovery_omits_unexpected_fields():
+    snapshot = make_snapshot()
+    snapshot.issue_discovery = {
+        "status": "complete",
+        "complete": True,
+        "issues_found": 1,
+        "scanned_items": 30,
+        "pages_fetched": 1,
+        "warnings": [],
+        "error": None,
+        "internal_path": "/tmp/repocompass-api-abc/repo.zip",
+        "debug_trace": "httpx.ConnectError('/private/tmp/proxy')",
+        "authorization": "Bearer secret-token",
+    }
+
+    app = create_app(analyzer=lambda url, workdir, fetch_issues: snapshot)
+    status, _, payload = call_api(
+        app,
+        "/analyze",
+        {"url": "https://github.com/example/repo"},
+    )
+
+    assert status == 200
+    assert payload["issue_discovery"] == {
+        "status": "complete",
+        "complete": True,
+        "issues_found": 1,
+        "scanned_items": 30,
+        "pages_fetched": 1,
+        "warnings": [],
+        "error": None,
+    }
+    serialized = json.dumps(payload)
+    assert "/tmp" not in serialized
+    assert "/private/tmp" not in serialized
+    assert "Bearer secret-token" not in serialized
+    assert "httpx" not in serialized
+    assert "ConnectError" not in serialized
+
+
+def test_analyze_budget_exhausted_issue_discovery_omits_unexpected_fields():
+    snapshot = make_snapshot()
+    snapshot.issue_discovery = {
+        "status": "budget_exhausted",
+        "complete": False,
+        "issues_found": 1,
+        "scanned_items": 300,
+        "pages_fetched": 3,
+        "warnings": [
+            "contribution issue scan stopped after 300 items "
+            "because the scan budget (300) was exhausted"
+        ],
+        "error": None,
+        "internal_path": "/tmp/repocompass-api-abc/repo.zip",
+        "debug_trace": "httpx.ConnectError('/private/tmp/proxy')",
+        "authorization": "Bearer secret-token",
+    }
+
+    app = create_app(analyzer=lambda url, workdir, fetch_issues: snapshot)
+    status, _, payload = call_api(
+        app,
+        "/analyze",
+        {"url": "https://github.com/example/repo"},
+    )
+
+    assert status == 200
+    assert payload["issue_discovery"] == {
+        "status": "budget_exhausted",
+        "complete": False,
+        "issues_found": 1,
+        "scanned_items": 300,
+        "pages_fetched": 3,
+        "warnings": [
+            "contribution issue scan stopped after 300 items "
+            "because the scan budget (300) was exhausted"
+        ],
+        "error": None,
+    }
+    serialized = json.dumps(payload)
+    assert "/tmp" not in serialized
+    assert "/private/tmp" not in serialized
+    assert "Bearer secret-token" not in serialized
+    assert "httpx" not in serialized
+    assert "ConnectError" not in serialized
+
+
+def test_analyze_sanitizes_invalid_issue_discovery_status_and_fields():
+    snapshot = make_snapshot()
+    snapshot.issue_discovery = {
+        "status": "PARTIAL /tmp/secret",
+        "complete": "false",
+        "issues_found": -1,
+        "scanned_items": True,
+        "pages_fetched": "3",
+        "warnings": [
+            "contribution issue scan stopped after 300 items "
+            "because the scan budget (300) was exhausted",
+            "httpx.ConnectError('/tmp/secret')",
+            {"path": "/tmp/secret"},
+        ],
+        "error": {
+            "type": "GitHubAPIError",
+            "message": "httpx.ConnectError('/tmp/secret')",
+            "status_code": 500,
+            "retry_after": "30",
+            "rate_limit_reset": "1712345678",
+            "token": "ghp_secret",
+        },
+        "internal_path": "/tmp/repocompass-api-abc/repo.zip",
+    }
+
+    app = create_app(analyzer=lambda url, workdir, fetch_issues: snapshot)
+    status, _, payload = call_api(
+        app,
+        "/analyze",
+        {"url": "https://github.com/example/repo"},
+    )
+
+    assert status == 502
+    assert payload["issue_discovery"] == {
+        "status": "failed",
+        "complete": False,
+        "issues_found": 0,
+        "scanned_items": 0,
+        "pages_fetched": 0,
+        "warnings": [
+            "contribution issue scan stopped after 300 items "
+            "because the scan budget (300) was exhausted"
+        ],
+        "error": {
+            "type": "GitHubAPIError",
+            "message": "Contribution issue discovery failed",
+            "status_code": 500,
+            "retry_after": "30",
+            "rate_limit_reset": "1712345678",
+        },
+    }
+    serialized = json.dumps(payload)
+    assert "/tmp" not in serialized
+    assert "/private/tmp" not in serialized
+    assert "ghp_secret" not in serialized
+    assert "httpx" not in serialized
+    assert "ConnectError" not in serialized
 
 
 def test_routes_and_methods():
@@ -606,3 +1344,124 @@ def test_response_size_limit_applies_to_error_responses_and_releases_slot():
     status, _, payload = call_api(app, "/health")
     assert status == 200
     assert payload == {"status": "ok"}
+
+
+def test_api_app_wsgi_compatibility():
+    status, headers, payload = call_api(app, "/health")
+
+    assert status == 200
+    assert headers["Content-Type"] == "application/json; charset=utf-8"
+    assert payload == {"status": "ok"}
+
+
+def test_resolve_serve_address_defaults(monkeypatch):
+    monkeypatch.delenv("HOST", raising=False)
+    monkeypatch.delenv("PORT", raising=False)
+
+    assert _resolve_serve_address() == ("127.0.0.1", 8000)
+    assert _resolve_serve_address(host="0.0.0.0", port=9000) == (
+        "0.0.0.0",
+        9000,
+    )
+
+
+def test_resolve_serve_address_uses_env(monkeypatch):
+    monkeypatch.setenv("HOST", "0.0.0.0")
+    monkeypatch.setenv("PORT", "5050")
+
+    assert _resolve_serve_address() == ("0.0.0.0", 5050)
+    assert _resolve_serve_address(port=6000) == ("0.0.0.0", 6000)
+
+
+@pytest.mark.parametrize(
+    "port_value",
+    ["abc", "", "-1", "0", "65536", "1.5", True, False],
+)
+def test_resolve_serve_address_rejects_invalid_port(monkeypatch, port_value):
+    monkeypatch.delenv("PORT", raising=False)
+
+    with pytest.raises(ValueError):
+        _resolve_serve_address(port=port_value)
+
+    if isinstance(port_value, str):
+        monkeypatch.setenv("PORT", port_value)
+        with pytest.raises(ValueError):
+            _resolve_serve_address()
+
+
+def test_serve_uses_resolved_defaults(monkeypatch):
+    import wsgiref.simple_server
+
+    monkeypatch.delenv("HOST", raising=False)
+    monkeypatch.delenv("PORT", raising=False)
+
+    calls = {}
+
+    class DummyServer:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def serve_forever(self):
+            calls["served"] = True
+
+    def fake_make_server(host, port, app_obj, **kwargs):
+        calls["host"] = host
+        calls["port"] = port
+        calls["app"] = app_obj
+        calls["kwargs"] = kwargs
+        return DummyServer()
+
+    monkeypatch.setattr(
+        wsgiref.simple_server,
+        "make_server",
+        fake_make_server,
+    )
+
+    serve()
+
+    assert calls["host"] == "127.0.0.1"
+    assert calls["port"] == 8000
+    assert calls["app"] is app
+    assert calls["served"] is True
+    assert calls["kwargs"]["server_class"].__name__ == "ThreadingWSGIServer"
+
+
+def test_serve_uses_port_env(monkeypatch):
+    import wsgiref.simple_server
+
+    monkeypatch.delenv("HOST", raising=False)
+    monkeypatch.setenv("PORT", "5050")
+
+    calls = {}
+
+    class DummyServer:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def serve_forever(self):
+            calls["served"] = True
+
+    def fake_make_server(host, port, app_obj, **kwargs):
+        calls["host"] = host
+        calls["port"] = port
+        calls["app"] = app_obj
+        return DummyServer()
+
+    monkeypatch.setattr(
+        wsgiref.simple_server,
+        "make_server",
+        fake_make_server,
+    )
+
+    serve()
+
+    assert calls["host"] == "127.0.0.1"
+    assert calls["port"] == 5050
+    assert calls["app"] is app
+    assert calls["served"] is True
