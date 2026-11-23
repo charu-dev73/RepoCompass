@@ -1,35 +1,154 @@
 # RepoCompass
 
-## HTTP API
+**Understand unfamiliar Python repositories. Find your way through the code. Discover contribution opportunities.**
 
-RepoCompass exposes a WSGI application at `api:app` for HTTP analysis requests.
+RepoCompass is a Python-based repository analysis tool that helps developers navigate unfamiliar GitHub projects.
 
-### Endpoints
+Given a public GitHub repository URL, it analyzes the repository's Python code, builds a dependency graph, identifies likely entry points, generates a suggested reading path, and discovers beginner-friendly contribution issues with relevant source files and documentation.
 
-- `GET /health`
-  - Example response: `{"status": "ok"}`
-- `GET /analyze?url=<github-repo-url>`
-  - Requires the `url` query parameter (public GitHub repository URL).
+## The problem
 
-Example:
+Contributing to an unfamiliar open-source project can be difficult. Before making a useful contribution, developers often need to understand:
+
+- Where the important code lives.
+- Which modules depend on each other.
+- Where execution is likely to begin.
+- Which files they should read first.
+- Which open issues might be suitable starting points.
+
+RepoCompass brings these pieces of information together to make repository exploration more structured.
+
+## Features
+
+- **Repository discovery:** Fetches and discovers Python source files and documentation.
+- **Python analysis:** Parses Python files and extracts import relationships.
+- **Dependency graph:** Resolves dependencies and constructs a graph of Python modules.
+- **Entry-point detection:** Identifies likely application entry points and secondary entry points.
+- **Guided reading path:** Suggests an ordered path through relevant files, with explanations.
+- **Contribution discovery:** Finds beginner-friendly open issues and maps them to relevant Python files and documentation.
+- **CLI and HTTP API:** Supports both command-line analysis and HTTP-based repository analysis.
+
+## How it works
+
+A repository passes through the following analysis stages:
+
+1. **Fetch:** Retrieve repository metadata and download its source archive from GitHub.
+2. **Discover:** Identify Python files and documentation while applying repository safety and size limits.
+3. **Parse:** Analyze Python source files and extract import information.
+4. **Resolve:** Resolve import relationships between discovered modules.
+5. **Build graph:** Construct a dependency graph from the resolved relationships.
+6. **Identify entry points:** Detect likely entry points in the repository.
+7. **Generate reading path:** Produce an ordered sequence of files to explore.
+8. **Discover contributions:** Find suitable open issues and associate them with relevant code and documentation.
+
+## Installation
+
+Clone the repository:
 
 ```bash
-curl "http://127.0.0.1:8000/analyze?url=https://github.com/psf/requests"
+git clone https://github.com/charu-dev73/RepoCompass.git
+cd RepoCompass
 ```
 
-### Local development
+Create and activate a virtual environment:
 
-Install runtime dependencies:
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+Install dependencies:
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-For development and tests:
+For development and testing:
 
 ```bash
 python -m pip install -r requirements-dev.txt
 ```
+
+## Usage
+
+### Command-line interface
+
+Analyze a public GitHub repository:
+
+```bash
+python cli.py https://github.com/psf/requests
+```
+
+The CLI reports:
+
+- Repository analysis statistics.
+- Discovered and parsed Python files.
+- Documentation files.
+- Dependency graph nodes and edges.
+- Detected entry points.
+- Suggested reading path and explanations.
+- Beginner-friendly contribution issues.
+- Relevant source files and documentation for discovered issues.
+
+The CLI expects exactly one GitHub repository URL.
+
+### GitHub authentication
+
+Set `GITHUB_TOKEN` to use authenticated GitHub API access:
+
+```bash
+export GITHUB_TOKEN="your_github_token"
+```
+
+Authentication can improve API rate limits and reliability. Keep tokens private and never commit them to the repository.
+
+## Project architecture
+
+The project separates repository analysis into focused modules.
+
+| Module | Responsibility |
+|---|---|
+| `engine/fetch.py` | GitHub metadata, archive downloads, extraction and safety checks |
+| `engine/discover.py` | Source and documentation discovery |
+| `engine/parse.py` | Python source and import parsing |
+| `engine/resolve.py` | Import and module resolution |
+| `engine/graph.py` | Dependency graph construction |
+| `engine/entrypoints.py` | Entry-point detection |
+| `engine/reading_path.py` | Suggested file reading paths |
+| `engine/issues.py` | GitHub issue discovery |
+| `engine/issue_mapping.py` | Mapping issues to relevant Python files |
+| `engine/doc_issue_mapping.py` | Mapping issues to relevant documentation |
+| `engine/pipeline.py` | Coordinates the repository analysis pipeline |
+
+The command-line interface is implemented in `cli.py`, while `api.py` exposes the analysis pipeline through a WSGI application.
+
+## HTTP API
+
+RepoCompass exposes a WSGI application at `api:app`.
+
+### Endpoints
+
+**`GET /health`**
+
+Example response:
+
+```json
+{"status": "ok"}
+```
+
+**`GET /analyze?url=<github-repo-url>`**
+
+Requires the `url` query parameter containing a public GitHub repository URL.
+
+Example:
+
+```bash
+curl --get \
+  --data-urlencode "url=https://github.com/psf/requests" \
+  http://127.0.0.1:8000/analyze
+```
+
+### Local development
 
 Start the built-in threaded WSGI server:
 
@@ -37,51 +156,83 @@ Start the built-in threaded WSGI server:
 python -c "from api import serve; serve()"
 ```
 
-Local defaults (when not overridden): host `127.0.0.1`, port `8000`.
+Local defaults:
 
-`serve()` also supports environment-based configuration:
+- Host: `127.0.0.1`
+- Port: `8000`
 
-- `HOST` (optional): bind host when `host` is not passed explicitly (default: `127.0.0.1`)
-- `PORT` (optional): bind port when `port` is not passed explicitly (default: `8000`)
+Both can be configured using environment variables:
 
-### Production
+- `HOST`: Bind host when no explicit host is passed.
+- `PORT`: Bind port when no explicit port is passed.
 
-Use a production WSGI server with the module-level callable `api:app`.
+### Production deployment
 
-Example (Gunicorn):
+Use a production WSGI server such as Gunicorn:
 
 ```bash
 gunicorn --bind 0.0.0.0:$PORT api:app
 ```
 
-`$PORT` is the HTTP port provided by the hosting platform and must be set in that environment.
+The hosting environment must provide `PORT`.
 
 ### Environment variables
 
-- `PORT` (required by most hosting platforms for production): port to bind the HTTP server to.
-- `HOST` (optional): host interface for `serve()` local/dev server (default: `127.0.0.1`). For production Gunicorn deployments, set the bind address explicitly (for example `0.0.0.0:$PORT`).
-- `GITHUB_TOKEN` (optional): GitHub token used for repository metadata, archive download, and issue-discovery requests; can improve reliability/rate limits for upstream GitHub access.
+| Variable | Description |
+|---|---|
+| `HOST` | Optional bind host for the development server |
+| `PORT` | Optional local server port; generally provided by hosting platforms |
+| `GITHUB_TOKEN` | Optional GitHub token for authenticated API requests |
 
-### Status codes
+### HTTP status codes
 
-- `200`: analysis completed (JSON snapshot payload)
-- `400`: bad request (missing/invalid `url` or oversized input)
-- `404`: repository or route not found
-- `405`: method not allowed (`Allow: GET`)
-- `422`: repository/archive cannot be processed (for example too large or unsafe/invalid archive)
-- `500`: internal server error, or generated response exceeds the configured size limit (`{"error":"Response too large"}`)
-- `502`: upstream GitHub/fetch error, or issue discovery failed during analysis (sanitized snapshot/error payload returned)
-- `503`: analysis capacity unavailable (`{"error":"Repository analysis capacity reached"}`, `Retry-After: 1`)
+| Status | Meaning |
+|---|---|
+| `200` | Analysis completed |
+| `400` | Invalid or missing URL, or oversized input |
+| `404` | Repository or route not found |
+| `405` | Unsupported HTTP method |
+| `422` | Repository or archive cannot be processed |
+| `500` | Internal error or response exceeds configured size limit |
+| `502` | Upstream GitHub/fetch error or issue-discovery failure |
+| `503` | Analysis capacity unavailable |
 
-### Defaults and limits
+### API defaults and limits
 
-- Default concurrency: `2` concurrent analyses (`max_concurrent_analyses`)
-- Default URL/query input limit: `2048` characters (`max_url_length`)
-- Default response size limit: `5,000,000` bytes (`max_response_bytes`)
+| Setting | Default |
+|---|---:|
+| Concurrent analyses | 2 per process |
+| Maximum URL length | 2,048 characters |
+| Maximum response size | 5,000,000 bytes |
+| Maximum reported repository size | 200 MB |
+| Maximum downloaded ZIP size | 50 MB |
 
-### Operational caveats
+## Testing
 
-- No end-to-end analysis timeout.
-- Concurrency limits are per process (in-memory admission control).
-- Analyses perform live GitHub requests (metadata/archive/issues); upstream rate limiting or transient failures may return sanitized `502` responses.
-- The built-in `serve()` server is intended for local development; use a production WSGI server (for example Gunicorn) for deployed environments.
+Run the test suite:
+
+```bash
+python -m pytest -p no:cacheprovider -q
+```
+
+The tests cover repository fetching and extraction, source discovery, parsing, dependency resolution, graph construction, entry-point detection, reading paths, issue discovery, issue mapping, CLI behavior, and HTTP API behavior.
+
+## Limitations
+
+- Currently focuses on Python repositories.
+- Only the repository's default branch is analyzed.
+- Repository size is limited to 200 MB as reported by GitHub.
+- Downloaded ZIP archives are limited to 50 MB.
+- Repositories containing symbolic links are rejected for safety.
+- Skipped directories are identified by directory name.
+- Unauthenticated GitHub API requests are subject to rate limits.
+- Entry-point detection and issue-to-file mapping are heuristic and may not always identify the most relevant files.
+- The HTTP API has no end-to-end analysis timeout.
+- API concurrency limits are in-memory and apply per process.
+- Upstream GitHub failures and rate limits can affect analysis availability.
+
+The built-in `serve()` server is intended for local development. Use a production WSGI server for deployment.
+
+## License
+
+No license file is currently included in this repository.
