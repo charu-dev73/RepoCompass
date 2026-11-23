@@ -2,31 +2,28 @@
 
 **Understand unfamiliar Python repositories. Find your way through the code. Discover contribution opportunities.**
 
-RepoCompass is a Python-based repository analysis tool that helps developers navigate unfamiliar GitHub projects.
+RepoCompass is a Python CLI and WSGI API for exploring unfamiliar public GitHub Python repositories. It helps developers and new contributors get oriented by analyzing repository structure and surfacing where to start reading and contributing.
 
-Given a public GitHub repository URL, it analyzes the repository's Python code, builds a dependency graph, identifies likely entry points, generates a suggested reading path, and discovers beginner-friendly contribution issues with relevant source files and documentation.
+## Quick try
 
-## The problem
+```bash
+git clone https://github.com/charu-dev73/RepoCompass.git
+cd RepoCompass
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python cli.py https://github.com/psf/requests
+```
 
-Contributing to an unfamiliar open-source project can be difficult. Before making a useful contribution, developers often need to understand:
+## Core capabilities
 
-- Where the important code lives.
-- Which modules depend on each other.
-- Where execution is likely to begin.
-- Which files they should read first.
-- Which open issues might be suitable starting points.
-
-RepoCompass brings these pieces of information together to make repository exploration more structured.
-
-## Features
-
-- **Repository discovery:** Fetches and discovers Python source files and documentation.
-- **Python analysis:** Parses Python files and extracts import relationships.
-- **Dependency graph:** Resolves dependencies and constructs a graph of Python modules.
-- **Entry-point detection:** Identifies likely application entry points and secondary entry points.
-- **Guided reading path:** Suggests an ordered path through relevant files, with explanations.
-- **Contribution discovery:** Finds beginner-friendly open issues and maps them to relevant Python files and documentation.
-- **CLI and HTTP API:** Supports both command-line analysis and HTTP-based repository analysis.
+- **Repository discovery** - Fetches a GitHub repository archive and discovers Python source and documentation files.
+- **Python analysis** - Parses Python files and extracts import relationships.
+- **Dependency graph** - Builds a module dependency graph from resolved imports.
+- **Entry-point detection** - Identifies likely primary and secondary entry points.
+- **Guided reading path** - Suggests an ordered list of files to read, with reasons.
+- **Contribution discovery** - Finds beginner-friendly open issues and maps them to relevant code and docs.
+- **CLI and HTTP API** - Run analyses from the command line or through the `api:app` WSGI application.
 
 ## How it works
 
