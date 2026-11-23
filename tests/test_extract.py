@@ -128,6 +128,73 @@ def test_extract_repo_zip_rejects_zip_bomb_size(tmp_path, monkeypatch):
     with pytest.raises(UnsafeArchiveError):
         extract_repo_zip(zip_path, extract_dir)
 
+    assert not (extract_dir / "repo" / "large.txt").exists()
+
+
+def test_extract_repo_zip_enforces_actual_bytes_during_chunked_extraction(
+    tmp_path, monkeypatch
+):
+    zip_path = tmp_path / "chunked.zip"
+    extract_dir = tmp_path / "extracted"
+
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr("repo/first.txt", "0123456789")
+        archive.writestr("repo/second.txt", "abcdefghij")
+
+    # Declared uncompressed size (20) is within the limit, so the metadata
+    # pre-check must not reject this archive before extraction begins.
+    monkeypatch.setattr("engine.fetch.MAX_EXTRACT_BYTES", 25)
+
+    chunks = iter(
+        [
+            (b"x" * 10, "repo/first.txt"),
+            (b"", "repo/first.txt"),
+            (b"y" * 10, "repo/second.txt"),
+            (b"y" * 10, "repo/second.txt"),
+            (b"", "repo/second.txt"),
+        ]
+    )
+
+    def fake_read_chunk(source, member, path):
+        chunk, expected_file = next(chunks)
+        assert member.filename == expected_file
+        return chunk
+
+    monkeypatch.setattr("engine.fetch._read_archive_chunk", fake_read_chunk)
+
+    with pytest.raises(UnsafeArchiveError):
+        extract_repo_zip(zip_path, extract_dir)
+
+    # Failure cleanup removes extraction artifacts created by this call.
+    assert not extract_dir.exists()
+
+
+def test_extract_repo_zip_cleans_up_created_paths_on_actual_byte_rejection(
+    tmp_path, monkeypatch
+):
+    zip_path = tmp_path / "cleanup.zip"
+    extract_dir = tmp_path / "out"
+
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr("repo/nested/file.txt", "0123456789")
+
+    # Declared uncompressed size (10) is within the limit; rejection must come
+    # from cumulative actual bytes, not the metadata pre-check.
+    monkeypatch.setattr("engine.fetch.MAX_EXTRACT_BYTES", 12)
+
+    chunks = iter([b"y" * 7, b"y" * 7])
+
+    def fake_read_chunk(source, member, path):
+        assert member.filename == "repo/nested/file.txt"
+        return next(chunks)
+
+    monkeypatch.setattr("engine.fetch._read_archive_chunk", fake_read_chunk)
+
+    with pytest.raises(UnsafeArchiveError):
+        extract_repo_zip(zip_path, extract_dir)
+
+    assert not extract_dir.exists()
+
 
 def test_extract_repo_zip_skips_archive_symlink(tmp_path):
     zip_path = tmp_path / "unsafe.zip"

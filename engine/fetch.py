@@ -626,6 +626,7 @@ def extract_repo_zip(
             _reject_file_directory_collisions(safe_members)
 
             top_level_dir = next(iter(top_level_dirs))
+            extracted_bytes = 0
 
             for member, target_path, _ in safe_members:
                 try:
@@ -668,7 +669,14 @@ def extract_repo_zip(
                                 if not chunk:
                                     break
 
+                                if extracted_bytes + len(chunk) > MAX_EXTRACT_BYTES:
+                                    raise UnsafeArchiveError(
+                                        "Repository ZIP extraction would exceed "
+                                        f"the {MAX_EXTRACT_BYTES} byte limit"
+                                    )
+
                                 destination.write(chunk)
+                                extracted_bytes += len(chunk)
 
                 except OSError as exc:
                     raise UnsafeArchiveError(
