@@ -15,6 +15,41 @@ python -m pip install -r requirements.txt
 python cli.py https://github.com/psf/requests
 ```
 
+## Sample output
+
+Excerpt from a previous analysis of `pallets/flask` (not the full CLI output):
+
+```text
+Repository: pallets/flask
+Python files discovered: 83
+Python files parsed: 83
+Documentation files discovered: 82
+Files with main guard: 1
+Files with parse errors: 0
+Skipped directories: 0
+Dependency graph nodes: 83
+Dependency graph edges: 176
+
+Detected entry points:
+  - src/flask/__main__.py
+  - src/flask/cli.py
+  - src/flask/app.py
+  - src/flask/sansio/app.py
+
+Suggested reading path:
+  1. src/flask/__main__.py
+  2. src/flask/cli.py
+  3. src/flask/app.py
+  4. src/flask/sansio/app.py
+  5. src/flask/__init__.py
+  6. src/flask/globals.py
+  7. src/flask/helpers.py
+  8. src/flask/ctx.py
+
+Beginner-friendly contribution issues:
+  No matching open issues found.
+```
+
 ## Core capabilities
 
 - **Repository discovery** - Fetches a GitHub repository archive and discovers Python source and documentation files.
